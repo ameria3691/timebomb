@@ -1,5 +1,5 @@
---// TIMEBOMB AI v4 · LEGEND EDITION
---// Time Calc | Edge Analysis | Opponent Memory | Smart Flee | Dodge Skills | CamTrack | Radar UI
+--// TIMEBOMB AI v5 · LEGEND EDITION
+--// Time Calc | Edge Analysis | Opponent Memory | Smart Flee | Dodge Skills | Jump Dodges | Auto Climb | CamTrack | Radar UI
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
@@ -20,6 +20,9 @@ local Config = {
 	Memory = true,      -- ذاكرة الخصوم
 	Nav = true,         -- ملاحة: تجنب الحواجز + مسار + صعود
 	Parkour = true,     -- قفز/باركور/اختباء خلف الأعمدة
+	Climb = true,       -- يطلع فوق لو الخصم فوق
+	JumpDodge = true,   -- مراوغات القفز (تشتغل فقط لو القفز ممكن في الساحة)
+	JumpRate = 0.6,     -- كثرة مراوغات القفز
 	Immunity = 2.5,     -- مدة حماية اللي مرر لك (ما تقدر ترجعها له)
 	PassRange = 12,
 	FleeRange = 16.5,
@@ -43,6 +46,7 @@ local C = {
 	bad = Color3.fromRGB(255, 70, 95),
 	off = Color3.fromRGB(70, 70, 98),
 	corner = Color3.fromRGB(255, 60, 200),
+	line = Color3.fromRGB(48, 48, 76),
 }
 
 local alive = true
@@ -57,8 +61,8 @@ local State = {
 	arenaCenter = nil, focus = nil, focusDist = math.huge,
 	peak = 0, lastHT = 0, lockedTarget = nil, dots = {}, lastThreat = nil, lastThreatT = 0, stalk = nil,
 }
-local Style = { mode = "", name = "", untilT = 0, phaseT = 0, dir = 1, period = 0.4, cache = nil, cacheT = 0, lastSide = 0 }
-local Stats = { rounds = 0, passes = 0, t0 = os.clock() }
+local Style = { mode = "", name = "", untilT = 0, phaseT = 0, dir = 1, period = 0.4, cache = nil, cacheT = 0, lastSide = 0, nextJump = 0 }
+local Stats = { rounds = 0, passes = 0, jumps = 0, climbs = 0, t0 = os.clock() }
 
 local function now() return os.clock() end
 local function flat(v) return Vector3.new(v.X, 0, v.Z) end
@@ -67,6 +71,7 @@ local function unit(v)
 	return v.Unit
 end
 local function perp(v) return Vector3.new(-v.Z, 0, v.X) end
+local function rotate(v, deg) return (CFrame.Angles(0, math.rad(deg), 0) * CFrame.new(v)).Position end
 
 --------------------------------------------------------------------
 -- 1) الفحوصات
@@ -284,6 +289,9 @@ local function clearLine(from, to)
 	return true
 end
 
+----------------------------------------------------------------
+-- نظام القفز: كشف إمكانية القفز في الساحة + قفز موثوق + تحقق فعلي
+----------------------------------------------------------------
 local function jumpHeightOf(hum)
 	if hum.UseJumpPower then
 		local jp = hum.JumpPower
@@ -292,22 +300,70 @@ local function jumpHeightOf(hum)
 	return hum.JumpHeight
 end
 
-local lastJump = 0
+local Jump = { fails = 0, blockedUntil = 0, last = 0 }
+
+-- هل القفز ممكن الحين؟ (الحالة مفعلة + قوة قفز كافية + ما فشل القفز عدة مرات)
+local function canJump(hum)
+	if not hum or hum.Health <= 0 then return false end
+	if now() < Jump.blockedUntil then return false end
+	local ok, enabled = pcall(function() return hum:GetStateEnabled(Enum.HumanoidStateType.Jumping) end)
+	if ok and enabled == false then return false end
+	return jumpHeightOf(hum) >= 1.5
+end
+
+-- بعد القفزة نتأكد إنها صارت فعلاً؛ لو فشلت كذا مرة نعتبر القفز مقفول في هالساحة
+local function verifyJump(hum)
+	task.delay(0.28, function()
+		if not alive or not hum.Parent then return end
+		local _, hrp = getCharacterParts(LP)
+		local st = hum:GetState()
+		local up = hrp ~= nil and hrp.AssemblyLinearVelocity.Y > 6
+		if st == Enum.HumanoidStateType.Jumping or st == Enum.HumanoidStateType.Freefall
+			or up or hum.FloorMaterial == Enum.Material.Air then
+			Jump.fails = 0
+		else
+			Jump.fails += 1
+			if Jump.fails >= 4 then
+				Jump.fails = 0
+				Jump.blockedUntil = now() + 20
+				if toast then toast("JUMP LOCKED  •  القفز مقفول هنا", C.warn) end
+			end
+		end
+	end)
+end
+
 local function forceJump(hum)
-	if now() - lastJump < 0.35 then return end
-	lastJump = now()
+	if not canJump(hum) then return false end
+	if hum.FloorMaterial == Enum.Material.Air then return false end -- لازم تكون على الأرض
+	local t = now()
+	if t - Jump.last < 0.35 then return false end
+	Jump.last = t
 	hum.Jump = true
+	-- Humanoid.Jump لحاله ينلغي أحياناً من سكربت التحكم، فنأكده بتغيير الحالة
+	pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+	Stats.jumps += 1
+	verifyJump(hum)
+	return true
 end
 
 local function tryJump(hum, chance)
-	if now() - lastJump > 0.9 and rng:NextNumber() < chance then
-		lastJump = now()
-		hum.Jump = true
+	if now() - Jump.last > 0.9 and rng:NextNumber() < chance then
+		return forceJump(hum)
+	end
+	return false
+end
+
+-- قفز متكرر بفاصل معين (للمراوغات)
+local function pulseJump(hum, interval)
+	local t = now()
+	if t >= (Style.nextJump or 0) and forceJump(hum) then
+		Style.nextJump = t + interval
 	end
 end
 
 -- حاجز واطي قدامك تقدر تقفز فوقه؟
 local function ledgeAhead(hrp, hum, dir)
+	if not canJump(hum) then return false end
 	dir = unit(flat(dir))
 	local feetY = hrp.Position.Y - (hum.HipHeight + hrp.Size.Y / 2)
 	local px, pz = hrp.Position.X, hrp.Position.Z
@@ -324,7 +380,7 @@ local function steerDir(hrp, dir, dist)
 	dir = unit(flat(dir))
 	dist = dist or 6
 	for _, ang in ipairs(STEER_ANGLES) do
-		local d = unit((CFrame.Angles(0, math.rad(ang), 0) * CFrame.new(dir)).Position)
+		local d = unit(rotate(dir, ang))
 		local to = hrp.Position + d * dist
 		if clearLine(hrp.Position, to) and hasFloorAt(to) then return d end
 	end
@@ -386,6 +442,30 @@ local function navCompute(hrp, goal)
 	end)
 end
 
+-- يمشي على المسار الجاهز (مع قفز عند نقاط القفز أو لما النقطة التالية أعلى منك)
+local function followPath(hrp, hum)
+	local wps = Nav.wps
+	if not wps then return false end
+	local pos = hrp.Position
+	while wps[Nav.idx] and flat(wps[Nav.idx].Position - pos).Magnitude < 3.2 and math.abs(wps[Nav.idx].Position.Y - pos.Y) < 5 do
+		Nav.idx += 1
+	end
+	local wp = wps[Nav.idx]
+	if wp then
+		local feetY = pos.Y - (hum.HipHeight + hrp.Size.Y / 2)
+		local near = flat(wp.Position - pos).Magnitude
+		if wp.Action == Enum.PathWaypointAction.Jump and near < 7 then
+			forceJump(hum)
+		elseif wp.Position.Y - feetY > 2 and near < 5 then
+			forceJump(hum)
+		end
+		hum:MoveTo(wp.Position)
+		return true
+	end
+	Nav.wps = nil
+	return false
+end
+
 -- حركة ذكية للمطاردة: تتجنب الجدران، تقفز على الحواجز الواطية، وتستخدم مسار للصعود والالتفاف
 local function navMove(hrp, hum, goal)
 	local pos = hrp.Position
@@ -416,19 +496,7 @@ local function navMove(hrp, hum, goal)
 	if not Nav.wps or not Nav.goal or flat(Nav.goal - goal).Magnitude > 6 then
 		navCompute(hrp, goal)
 	end
-	local wps = Nav.wps
-	if wps then
-		while wps[Nav.idx] and flat(wps[Nav.idx].Position - pos).Magnitude < 3.2 and math.abs(wps[Nav.idx].Position.Y - pos.Y) < 5 do
-			Nav.idx += 1
-		end
-		local wp = wps[Nav.idx]
-		if wp then
-			if wp.Action == Enum.PathWaypointAction.Jump and flat(wp.Position - pos).Magnitude < 7 then forceJump(hum) end
-			hum:MoveTo(wp.Position)
-			return
-		end
-		Nav.wps = nil
-	end
+	if followPath(hrp, hum) then return end
 
 	-- ما في مسار جاهز: توجيه مباشر حول الحواجز
 	local sd = steerDir(hrp, dirG, 8)
@@ -485,30 +553,81 @@ local function coverPoint(hrp, thrp, pl)
 	return c + away * r
 end
 
--- حافة/منصة قريبة تقدر تقفز عليها للهروب لفوق
-local function findLedge(hrp, hum, thrp)
+-- حافة/منصة قريبة تقدر تقفز عليها
+--   بدون goal: تختار الأبعد عن المطارد (للهروب لفوق)
+--   مع goal:   تختار الأعلى والأقرب للهدف (للتسلق)
+local function findLedge(hrp, hum, thrp, goal)
+	if not canJump(hum) then return nil end
 	local jh = math.max(jumpHeightOf(hum) - 0.6, 2)
 	local feetY = hrp.Position.Y - (hum.HipHeight + hrp.Size.Y / 2)
 	local px, pz = hrp.Position.X, hrp.Position.Z
+	local stepA = goal and 30 or 45
+	local reach = goal and 16 or 12
 	local best, bestScore
-	for a = 0, 315, 45 do
+	for a = 0, 359, stepA do
 		local dir = Vector3.new(math.cos(math.rad(a)), 0, math.sin(math.rad(a)))
-		local low = castHard(Vector3.new(px, feetY + 0.8, pz), dir * 12)
+		local low = castHard(Vector3.new(px, feetY + 0.8, pz), dir * reach)
 		if low and low.Normal.Y < 0.5 and low.Distance > 1 then
 			local high = castHard(Vector3.new(px, feetY + jh + 1.2, pz), dir * (low.Distance + 3))
 			if not high then
 				local topO = low.Position + dir * 2 + Vector3.new(0, jh + 3, 0)
 				local top = castHard(topO, Vector3.new(0, -(jh + 3.8), 0))
 				if top and top.Position.Y > feetY + 1.2 and top.Position.Y < feetY + jh + 0.3 then
-					local score = (thrp and flat(low.Position - thrp.Position).Magnitude or 0) - low.Distance
+					local score
+					if goal then
+						score = (top.Position.Y - feetY) * 3 - flat(top.Position - goal).Magnitude
+					else
+						score = (thrp and flat(low.Position - thrp.Position).Magnitude or 0) - low.Distance
+					end
 					if not best or score > bestScore then
-						best, bestScore = { point = low.Position - dir * 1.5, dir = dir }, score
+						best, bestScore = { point = low.Position - dir * 1.5, dir = dir, top = top.Position }, score
 					end
 				end
 			end
 		end
 	end
 	return best
+end
+
+-- تسلق: الهدف فوقك → مسار، وإذا ما في مسار يقفز من حافة لحافة لين يوصله
+local climbCache, climbT = nil, 0
+local function climbMove(hrp, hum, goal)
+	local pos = hrp.Position
+	local to = goal - pos
+	local fd = flat(to).Magnitude
+	local jh = jumpHeightOf(hum)
+	if stuckCheck(hrp, hum, to) then return true end
+
+	-- تحته أو جنبه وضمن مدى القفز: اقفز عليه
+	if fd < 6 and to.Y <= jh + 2.5 then
+		hum:MoveTo(pos + unit(flat(to)) * 8)
+		if forceJump(hum) then Stats.climbs += 1 end
+		return true
+	end
+
+	-- 1) مسار
+	if not Nav.wps or not Nav.goal or flat(Nav.goal - goal).Magnitude > 6 then
+		navCompute(hrp, goal)
+	end
+	if followPath(hrp, hum) then return true end
+
+	-- 2) حافة تقفز عليها وتقربك منه
+	if now() - climbT > 0.35 then
+		climbT = now()
+		climbCache = findLedge(hrp, hum, nil, goal)
+	end
+	local lg = climbCache
+	if lg then
+		local lp = Vector3.new(lg.point.X, pos.Y, lg.point.Z)
+		if flat(lp - pos).Magnitude < 2.8 then
+			hum:MoveTo(pos + lg.dir * 8)
+			if forceJump(hum) then Stats.climbs += 1 end
+		else
+			hum:MoveTo(lp)
+		end
+		return true
+	end
+	return false
 end
 
 local function nearestEnemy(maxD)
@@ -776,6 +895,7 @@ local function chooseTarget(cands, myHum)
 	if #cands == 0 then return nil end
 	local u = urgencyOf(State.myTime)
 	local speed = math.max(myHum and myHum.WalkSpeed or 16, 8)
+	local jmpOK = myHum ~= nil and canJump(myHum)
 	local best, bestScore
 	local _, mh = getCharacterParts(LP)
 	local myY = mh and mh.Position.Y or 0
@@ -808,7 +928,8 @@ local function chooseTarget(cands, myHum)
 			local eta = c.d / speed
 			if eta > State.myTime * 0.9 then s -= (eta - State.myTime * 0.9) * 10 end
 		end
-		s -= math.max(c.hrp.Position.Y - myY, 0) * 0.6 -- الأهداف العالية أصعب
+		-- الأهداف العالية أصعب (أخف لو تقدر تقفز وتتسلق)
+		s -= math.max(c.hrp.Position.Y - myY, 0) * ((jmpOK and Config.Climb) and 0.25 or 0.8)
 		if State.lockedTarget == c.plr then s += 6 end
 		if not best or s > bestScore then best, bestScore = c, s end
 	end
@@ -918,7 +1039,7 @@ local function bestEscapePoint(hrp, thrp)
 end
 
 --------------------------------------------------------------------
--- المراوغات والمطاردة (مهارات كثيرة + ملاحة)
+-- المراوغات والمطاردة (مهارات كثيرة + ملاحة + قفز)
 --------------------------------------------------------------------
 local function pickWeighted(list)
 	local sum = 0
@@ -932,16 +1053,21 @@ local function pickWeighted(list)
 end
 
 local FLEE_DUR = {
+	-- عادية
 	smart = { 0.6, 1.4 }, zigzag = { 1.0, 2.0 }, circle = { 1.0, 2.0 }, feint = { 0.7, 0.7 },
-	brake = { 0.6, 0.6 }, kite = { 1.0, 2.0 }, juke = { 0.9, 0.9 }, bhop = { 1.0, 1.8 },
-	pillar = { 1.2, 2.5 }, hop = { 1.2, 1.2 },
+	brake = { 0.6, 0.6 }, kite = { 1.0, 2.0 }, juke = { 0.9, 0.9 }, pillar = { 1.2, 2.5 },
+	weave = { 1.0, 1.8 }, snake = { 0.9, 1.6 }, spiral = { 1.0, 1.8 }, stopgo = { 0.8, 0.8 },
+	loop = { 1.5, 2.5 }, dash = { 0.6, 0.9 }, cutback = { 0.9, 0.9 },
+	-- قفز (فقط لو القفز ممكن)
+	bhop = { 1.0, 1.8 }, hop = { 1.2, 1.2 }, jumpjuke = { 0.9, 0.9 }, hopcircle = { 1.2, 2.0 },
+	leap = { 1.0, 1.6 }, jumpfeint = { 0.8, 0.8 }, zigjump = { 1.0, 1.8 }, doublehop = { 1.0, 1.0 },
 }
 
 local function pickFleeStyle(ctx, d, forceSide, m)
 	local t = now()
 	local k = 1.5 - Config.Aggro
 	local uh = urgencyOf(State.threatTime)
-	Style.mode, Style.phaseT, Style.cache, Style.data = "flee", t, nil, nil
+	Style.mode, Style.phaseT, Style.cache, Style.data, Style.nextJump = "flee", t, nil, nil, 0
 	Style.dir = rng:NextInteger(0, 1) == 0 and 1 or -1
 	Style.period = rng:NextNumber(0.25, 0.6)
 	local dur
@@ -955,28 +1081,45 @@ local function pickFleeStyle(ctx, d, forceSide, m)
 	else
 		local last2 = State.threatTime ~= nil and State.threatTime <= 2.5
 		local pillar = Config.Parkour and findPillar(ctx.hrp) or nil
-		local ledge = Config.Parkour and findLedge(ctx.hrp, ctx.hum, ctx.thrp) or nil
-		local list
+		local jmp = Config.JumpDodge and Config.JumpRate > 0.01 and canJump(ctx.hum)
+		local ledge = (jmp and Config.Parkour) and findLedge(ctx.hrp, ctx.hum, ctx.thrp) or nil
+		local jw = Config.JumpRate * 2
+		local list = {}
+		local function add(name, w) list[#list + 1] = { name, w } end
+		local function addJ(name, w) if jmp then add(name, w * jw) end end
+		local hasCenter = getCenter() ~= nil
+
 		if last2 then
 			-- آخر ثواني: لا تخليه يمررها لك
-			list = { { "kite", 3 }, { "juke", 2 }, { "sidestep", 1 } }
-			if pillar then list[#list + 1] = { "pillar", 2 } end
-			if ledge then list[#list + 1] = { "hop", 2 } end
+			add("kite", 3); add("juke", 2); add("sidestep", 1); add("dash", 1.5); add("cutback", 1.5)
+			if pillar then add("pillar", 2) end
+			if ledge then add("hop", 2 * jw) end
+			addJ("jumpjuke", 2); addJ("leap", 2)
 		elseif Config.TimeAware and uh > 0.7 then
-			list = { { "kite", 2 }, { "zigzag", 1.2 }, { "circle", 1 }, { "juke", 1.5 }, { "bhop", 1 } }
-			if d > 9 then list[#list + 1] = { "feint", 1.2 } end
-			if pillar then list[#list + 1] = { "pillar", 2 } end
-			if ledge then list[#list + 1] = { "hop", 1.5 } end
+			add("kite", 2); add("zigzag", 1.2); add("circle", 1); add("juke", 1.5)
+			add("weave", 1); add("spiral", 1); add("dash", 1.2); add("stopgo", 0.8)
+			if d > 9 then add("feint", 1.2) end
+			if pillar then add("pillar", 2) end
+			if ledge then add("hop", 1.5 * jw) end
+			addJ("bhop", 1); addJ("jumpjuke", 1.5); addJ("zigjump", 1.2); addJ("doublehop", 1.2); addJ("leap", 1)
 		elseif Config.TimeAware and uh < 0.3 and d > 12 then
-			list = { { "smart", 3 }, { "kite", 2.5 }, { "circle", 1 } }
-			if pillar then list[#list + 1] = { "pillar", 1.5 } end
+			add("smart", 3); add("kite", 2.5); add("circle", 1); add("weave", 1); add("snake", 1)
+			if hasCenter then add("loop", 1.5) end
+			if pillar then add("pillar", 1.5) end
+			addJ("hopcircle", 1); addJ("bhop", 0.8)
 		else
-			list = { { "smart", 2 }, { "zigzag", 1.4 }, { "circle", 1.2 }, { "brake", 0.8 }, { "kite", 1 }, { "juke", 0.8 }, { "bhop", 0.8 } }
-			if d > 9 then list[#list + 1] = { "feint", 1 } end
-			if pillar then list[#list + 1] = { "pillar", 1.4 } end
-			if ledge then list[#list + 1] = { "hop", 1 } end
+			add("smart", 2); add("zigzag", 1.4); add("circle", 1.2); add("brake", 0.8); add("kite", 1)
+			add("juke", 0.8); add("weave", 1.2); add("snake", 1); add("spiral", 1); add("stopgo", 0.8)
+			add("dash", 1); add("cutback", 1)
+			if hasCenter then add("loop", 1) end
+			if d > 9 then add("feint", 1) end
+			if pillar then add("pillar", 1.4) end
+			if ledge then add("hop", 1 * jw) end
+			addJ("bhop", 0.8); addJ("jumpjuke", 1); addJ("hopcircle", 1); addJ("zigjump", 1)
+			addJ("leap", 1); addJ("doublehop", 1)
+			if d > 9 then addJ("jumpfeint", 1) end
 		end
-		if Config.Memory and m and m.erratic > 0.3 then list[#list + 1] = { "smart", 2 } end
+		if Config.Memory and m and m.erratic > 0.3 then add("smart", 2) end
 
 		Style.name = pickWeighted(list)
 		if Style.name == "sidestep" then Style.lastSide = t end
@@ -997,9 +1140,6 @@ local function fleePoint(hrp, hum, thrp, d)
 
 	if n == "smart" then
 		return bestEscapePoint(hrp, thrp)
-	elseif n == "bhop" then
-		tryJump(hum, 0.9)
-		return bestEscapePoint(hrp, thrp)
 	elseif n == "zigzag" then
 		local side = (math.floor(el / Style.period) % 2 == 0) and 1 or -1
 		p = pos + unit(away + perp(away) * side * 1.1) * 12
@@ -1019,7 +1159,7 @@ local function fleePoint(hrp, hum, thrp, d)
 		p = pos + unit(perp(v) * Style.dir + away * 0.4) * 12
 	elseif n == "kite" then
 		-- يدور حوله بمسافة آمنة (برا مدى الريتش)
-		local rot = (CFrame.Angles(0, math.rad(35 * Style.dir), 0) * CFrame.new(away)).Position
+		local rot = rotate(away, 35 * Style.dir)
 		local q = thrp.Position + unit(rot) * 20
 		p = Vector3.new(q.X, pos.Y, q.Z)
 	elseif n == "juke" then
@@ -1038,14 +1178,104 @@ local function fleePoint(hrp, hum, thrp, d)
 			if hasFloorAt(cp) then return cp end
 		end
 		return bestEscapePoint(hrp, thrp)
+
+	-------------------- مراوغات عادية جديدة --------------------
+	elseif n == "weave" then
+		-- تعرّج ناعم (موجة) وهو يبتعد
+		p = pos + unit(rotate(away, math.sin(el * (3.4 + Style.period * 4)) * 70)) * 12
+	elseif n == "snake" then
+		-- تعرّج سريع وضيق
+		p = pos + unit(rotate(away, math.sin(el * 9) * 45)) * 12
+	elseif n == "spiral" then
+		-- يلتف حوله بزاوية تكبر تدريجياً
+		local ang = math.clamp(25 + el * 70, 25, 110) * Style.dir
+		p = pos + unit(rotate(away, ang)) * 12
+	elseif n == "stopgo" then
+		-- جري ثم وقفة مفاجئة ثم انطلاقة جانبية
+		if el < 0.2 then
+			p = pos + away * 8
+		elseif el < 0.38 then
+			return pos
+		else
+			p = pos + unit(perp(away) * Style.dir + away * 0.5) * 14
+		end
+	elseif n == "loop" then
+		-- يلف حول مركز الساحة من الجهة اللي تبعده عن المطارد
+		local center = getCenter()
+		if not center then return bestEscapePoint(hrp, thrp) end
+		local toC = flat(center - pos)
+		if toC.Magnitude < 3 then return bestEscapePoint(hrp, thrp) end
+		local tang = perp(unit(toC)) * Style.dir
+		if tang:Dot(away) < 0 then tang = -tang end
+		p = pos + unit(tang + unit(toC) * 0.35) * 13
+	elseif n == "dash" then
+		-- اندفاع قطري عكس ميل المطارد ثم تغيير الجهة
+		local v = flat(thrp.AssemblyLinearVelocity)
+		local side = Style.dir
+		if v.Magnitude > 3 then side = (v:Dot(perp(away)) > 0) and -1 or 1 end
+		if el < 0.45 then
+			p = pos + unit(away + perp(away) * side) * 14
+		else
+			p = pos + unit(away - perp(away) * side * 0.5) * 14
+		end
+	elseif n == "cutback" then
+		-- جري مستقيم ثم التفاف حاد فجأة
+		if el < 0.35 then
+			p = pos + away * 12
+		else
+			p = pos + unit(rotate(away, 110 * Style.dir)) * 12
+		end
+
+	-------------------- مراوغات القفز (فقط لو القفز ممكن) --------------------
+	elseif n == "bhop" then
+		pulseJump(hum, 0.5)
+		return bestEscapePoint(hrp, thrp)
 	elseif n == "hop" then
 		local lg = Style.data
 		if lg then
 			local lp = Vector3.new(lg.point.X, pos.Y, lg.point.Z)
-			if flat(lp - pos).Magnitude < 2.5 then return pos + lg.dir * 8 end
+			if flat(lp - pos).Magnitude < 2.5 then
+				forceJump(hum)
+				return pos + lg.dir * 8
+			end
 			return lp
 		end
 		return bestEscapePoint(hrp, thrp)
+	elseif n == "jumpjuke" then
+		local side
+		if el < 0.15 then side = 1 elseif el < 0.3 then side = -1 elseif el < 0.45 then side = 1 end
+		if side then
+			p = pos + unit(perp(away) * side * Style.dir + away * 0.3) * 10
+		else
+			p = pos + unit(perp(away) * -Style.dir + away) * 14
+		end
+		pulseJump(hum, 0.45)
+	elseif n == "hopcircle" then
+		p = pos + unit(perp(away) * Style.dir + away * 0.35) * 12
+		pulseJump(hum, 0.55)
+	elseif n == "zigjump" then
+		local side = (math.floor(el / Style.period) % 2 == 0) and 1 or -1
+		p = pos + unit(away + perp(away) * side * 1.1) * 12
+		pulseJump(hum, math.max(Style.period * 1.2, 0.4))
+	elseif n == "doublehop" then
+		local sgn = (el < 0.5) and 1 or -1
+		p = pos + unit(away + perp(away) * sgn * Style.dir * 0.6) * 13
+		pulseJump(hum, 0.4)
+	elseif n == "leap" then
+		-- يستنى لين يقرب منه ثم يقفز قفزة جانبية
+		if d < 9 and State.approaching then
+			p = pos + unit(perp(away) * Style.dir + away * 0.7) * 13
+			pulseJump(hum, 0.5)
+		else
+			return bestEscapePoint(hrp, thrp)
+		end
+	elseif n == "jumpfeint" then
+		if el < 0.3 then
+			p = pos + unit(perp(away) * Style.dir - away * 0.3) * 10
+			pulseJump(hum, 0.5)
+		else
+			p = pos + unit(perp(away) * -Style.dir + away * 0.9) * 14
+		end
 	else
 		return bestEscapePoint(hrp, thrp)
 	end
@@ -1057,19 +1287,35 @@ local function fleePoint(hrp, hum, thrp, d)
 	return p
 end
 
-local function pickChaseStyle()
+local function pickChaseStyle(hum)
 	local t = now()
 	local k = 1.5 - Config.Aggro
-	Style.mode, Style.phaseT, Style.data = "chase", t, nil
+	Style.mode, Style.phaseT, Style.data, Style.nextJump = "chase", t, nil, 0
 	Style.dir = rng:NextInteger(0, 1) == 0 and 1 or -1
 	local u = urgencyOf(State.myTime)
+	local jmp = Config.JumpDodge and Config.JumpRate > 0.01 and canJump(hum)
+	local jw = Config.JumpRate * 2
 	local list
 	if Config.EdgeAI and State.targetEdge and State.targetEdge <= 16 then
-		list = { { "pin", 3 }, { "direct", 1 }, { "cutoff", 1 }, { "stutter", 0.6 } }
+		list = { { "pin", 3 }, { "direct", 1 }, { "cutoff", 1 }, { "stutter", 0.6 }, { "weave", 0.6 } }
 	elseif u < 0.3 then
-		list = { { "flank", 2 }, { "feint", 2 }, { "cutoff", 1.5 }, { "arc", 1.5 }, { "bait", 1.2 }, { "stutter", 1.2 }, { "mirror", 1.5 }, { "hopchase", 0.8 }, { "direct", 1 } }
+		list = {
+			{ "flank", 2 }, { "feint", 2 }, { "cutoff", 1.5 }, { "arc", 1.5 }, { "bait", 1.2 },
+			{ "stutter", 1.2 }, { "mirror", 1.5 }, { "direct", 1 }, { "weave", 1.4 }, { "ambush", 1.2 },
+		}
+		if jmp then
+			list[#list + 1] = { "hopchase", 0.8 * jw }
+			list[#list + 1] = { "hopflank", 1 * jw }
+			list[#list + 1] = { "hopweave", 1 * jw }
+			list[#list + 1] = { "leapin", 1 * jw }
+		end
 	else
-		list = { { "direct", 3 }, { "cutoff", 2 }, { "flank", 1.2 }, { "arc", 1.2 }, { "feint", 1 }, { "mirror", 0.8 }, { "hopchase", 0.8 } }
+		list = { { "direct", 3 }, { "cutoff", 2 }, { "flank", 1.2 }, { "arc", 1.2 }, { "feint", 1 }, { "mirror", 0.8 }, { "weave", 1 } }
+		if jmp then
+			list[#list + 1] = { "hopchase", 0.8 * jw }
+			list[#list + 1] = { "hopflank", 0.8 * jw }
+			list[#list + 1] = { "leapin", 1 * jw }
+		end
 	end
 	Style.name = pickWeighted(list)
 	local dur = rng:NextNumber(0.8, 1.5)
@@ -1077,7 +1323,7 @@ local function pickChaseStyle()
 	Style.untilT = t + dur * k
 end
 
-local function chasePoint(hrp, thrp, d, m)
+local function chasePoint(hrp, hum, thrp, d, m)
 	local pos = hrp.Position
 	local tpos = thrp.Position
 	local tvel = flat(thrp.AssemblyLinearVelocity)
@@ -1130,13 +1376,34 @@ local function chasePoint(hrp, thrp, d, m)
 			local q = pos - toT * 8
 			if hasFloorAt(q) then return q end
 		end
+	elseif n == "weave" or n == "hopweave" then
+		-- يقترب بتعرّج عشان يربك توقعاته
+		if n == "hopweave" and d > 6 then pulseJump(hum, 0.65) end
+		if d > 6 then
+			return predicted + perp(toT) * math.sin(el * 7) * math.clamp(d * 0.35, 0, 5)
+		end
+	elseif n == "ambush" then
+		-- يثبت لحظة ثم ينقض
+		if el < 0.45 and d > 9 then return pos end
+	elseif n == "hopchase" then
+		if d > 6 then pulseJump(hum, 0.6) end
+	elseif n == "hopflank" then
+		if d > 7 then
+			pulseJump(hum, 0.7)
+			local back = -unit(flat(thrp.CFrame.LookVector))
+			return predicted + back * 5 + perp(back) * Style.dir * 3
+		end
+	elseif n == "leapin" then
+		if d < 10 and d > 4 then pulseJump(hum, 0.55) end
 	end
 	return predicted
 end
 
 local function resetAI()
-	Style.mode, Style.name, Style.untilT, Style.cache, Style.data = "", "", 0, nil, nil
+	Style.mode, Style.name, Style.untilT, Style.cache, Style.data, Style.nextJump = "", "", 0, nil, nil, 0
 	State.peak, State.lastHT, State.lockedTarget = 0, 0, nil
+	Jump.fails, Jump.blockedUntil = 0, 0 -- كل جولة/ساحة نختبر القفز من جديد
+	climbCache = nil
 	navReset()
 end
 
@@ -1161,7 +1428,7 @@ local function aiStep()
 					Style.untilT = t + rng:NextNumber(1.5, 3)
 				end
 				local away = unit(flat(pos - sk.hrp.Position))
-				local rot = (CFrame.Angles(0, math.rad(30 * Style.dir), 0) * CFrame.new(away)).Position
+				local rot = rotate(away, 30 * Style.dir)
 				local p = sk.hrp.Position + unit(rot) * math.max(sk.d, 10)
 				steerMove(hrp, hum, Vector3.new(p.X, pos.Y, p.Z))
 			else
@@ -1170,23 +1437,33 @@ local function aiStep()
 			return
 		end
 
-		local _, thrp = getCharacterParts(tg)
+		local _, thrp, thum = getCharacterParts(tg)
 		if not thrp then return end
 		local d = State.targetDist
 		local u = urgencyOf(State.myTime)
-		if Style.mode ~= "chase" or t > Style.untilT then pickChaseStyle() end
+		if Style.mode ~= "chase" or t > Style.untilT then pickChaseStyle(hum) end
 
 		local p
 		if d < 6 or u > 0.75 then
 			p = thrp.Position + flat(thrp.AssemblyLinearVelocity) * math.clamp(d / 16, 0, 0.5)
 		else
-			p = chasePoint(hrp, thrp, d, State.targetMem)
+			p = chasePoint(hrp, hum, thrp, d, State.targetMem)
 		end
-		if (p - pos).Magnitude < 0.5 then hum:MoveTo(pos) else navMove(hrp, hum, p) end
 
-		if Style.name == "hopchase" and d > 6 then tryJump(hum, 0.9) end
-		local dy = thrp.Position.Y - pos.Y
-		if Config.Parkour and dy > 2 and dy < jumpHeightOf(hum) + 1 and d < 6 then forceJump(hum) end
+		-- الخصم واقف فوق (منصة/مرتفع) وأنا أقدر أقفز: اطلع له
+		local dyT = thrp.Position.Y - pos.Y
+		local standing = thum ~= nil and thum.FloorMaterial ~= Enum.Material.Air
+		local climbing = Config.Climb and dyT > 2.5 and standing and canJump(hum)
+
+		if climbing and climbMove(hrp, hum, thrp.Position) then
+			-- تسلق (مسار أو قفز من حافة لحافة)
+		elseif (p - pos).Magnitude < 0.5 then
+			hum:MoveTo(pos)
+		else
+			navMove(hrp, hum, p)
+		end
+
+		if Config.Parkour and dyT > 2 and dyT < jumpHeightOf(hum) + 1 and d < 6 then forceJump(hum) end
 	else
 		local th = State.threat
 		if not th or State.threatDist > Config.FleeRange + 14 then
@@ -1210,13 +1487,15 @@ local function aiStep()
 
 		if d < trig and State.approaching and Style.name ~= "sidestep" and t - Style.lastSide > 0.6 then
 			pickFleeStyle(ctx, d, true, m)
-			tryJump(hum, 0.7)
+			if Config.JumpDodge then tryJump(hum, 0.7) end
 		elseif t > Style.untilT then
 			pickFleeStyle(ctx, d, false, m)
 		end
 
 		steerMove(hrp, hum, fleePoint(hrp, hum, thrp, d))
-		if d < 10 then tryJump(hum, 0.12 * Config.Aggro + 0.2 * uh + (last2 and 0.25 or 0)) end
+		if Config.JumpDodge and d < 10 then
+			tryJump(hum, 0.12 * Config.Aggro + 0.2 * uh + (last2 and 0.25 or 0))
+		end
 	end
 end
 
@@ -1256,7 +1535,7 @@ local function reachStep()
 end
 
 --------------------------------------------------------------------
--- 3) الواجهة LEGEND UI
+-- 3) الواجهة LEGEND UI v5
 --------------------------------------------------------------------
 local function tween(o, t, props)
 	TweenService:Create(o, TweenInfo.new(t, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props):Play()
@@ -1266,6 +1545,15 @@ local function corner(inst, r)
 	c.CornerRadius = UDim.new(0, r)
 	c.Parent = inst
 	return c
+end
+local function addStroke(inst, color, thick, transp)
+	local s = Instance.new("UIStroke")
+	s.Color = color
+	s.Thickness = thick or 1
+	s.Transparency = transp or 0
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = inst
+	return s
 end
 local function label(parent, text, size, color, font)
 	local l = Instance.new("TextLabel")
@@ -1297,73 +1585,103 @@ for _, old in ipairs(gui.Parent:GetChildren()) do
 	if old.Name == "MatchPanelUI" and old ~= gui then old:Destroy() end
 end
 
-local FULL_SIZE, MINI_SIZE = UDim2.new(0, 290, 0, 380), UDim2.new(0, 290, 0, 36)
+-- حجم القائمة يتكيف مع الشاشة (جوال/كمبيوتر)
+local camera = Workspace.CurrentCamera
+local vp = camera and camera.ViewportSize or Vector2.new(1280, 720)
+local PANEL_W = 316
+local HEAD_H = 46
+local FULL_H = math.clamp(vp.Y - 70, 330, 480)
+local FULL_SIZE, MINI_SIZE = UDim2.new(0, PANEL_W, 0, FULL_H), UDim2.new(0, PANEL_W, 0, HEAD_H)
 
 local main = Instance.new("Frame")
+main.Name = "Main"
 main.Size = MINI_SIZE
-main.Position = UDim2.new(0, 14, 0.12, 0)
+main.Position = UDim2.new(0, 14, 0.1, 0)
 main.BackgroundColor3 = C.panel
 main.BorderSizePixel = 0
 main.ClipsDescendants = true
+main.Active = true
 main.Parent = gui
-corner(main, 12)
+corner(main, 14)
 
-local stroke = Instance.new("UIStroke")
-stroke.Thickness = 2
-stroke.Color = Color3.new(1, 1, 1)
-stroke.Parent = main
-local strokeGrad = gradient(stroke, C.accent, C.accent2, 0)
+local mainStroke = addStroke(main, Color3.new(1, 1, 1), 2, 0)
+local strokeGrad = gradient(mainStroke, C.accent, C.accent2, 0)
 
--- شريط العنوان
+-- شريط العنوان (كبسولة عائمة) + أزرار  -  +  x
 local title = Instance.new("Frame")
-title.Size = UDim2.new(1, 0, 0, 36)
+title.Name = "Header"
+title.Position = UDim2.new(0, 6, 0, 6)
+title.Size = UDim2.new(1, -12, 0, 34)
 title.BackgroundColor3 = Color3.new(1, 1, 1)
 title.BorderSizePixel = 0
 title.Parent = main
-local titleGrad = gradient(title, Color3.fromRGB(60, 40, 140), Color3.fromRGB(20, 90, 130), 0)
+corner(title, 10)
+local titleGrad = gradient(title, Color3.fromRGB(70, 45, 160), Color3.fromRGB(20, 100, 140), 0)
 
-local titleLabel = label(title, "TIMEBOMB AI", 15, C.text, Enum.Font.GothamBlack)
+local titleLabel = label(title, "TIMEBOMB AI", 14, C.text, Enum.Font.GothamBlack)
 titleLabel.Position = UDim2.new(0, 12, 0, 3)
-titleLabel.Size = UDim2.new(1, -80, 0, 18)
-local titleSub = label(title, "v4  ·  LEGEND EDITION", 10, Color3.fromRGB(190, 200, 255), Enum.Font.GothamMedium)
-titleSub.Position = UDim2.new(0, 12, 0, 20)
-titleSub.Size = UDim2.new(1, -80, 0, 12)
+titleLabel.Size = UDim2.new(1, -130, 0, 16)
+local titleSub = label(title, "v5  ·  LEGEND EDITION", 9, Color3.fromRGB(190, 200, 255), Enum.Font.GothamMedium)
+titleSub.Position = UDim2.new(0, 12, 0, 19)
+titleSub.Size = UDim2.new(1, -130, 0, 12)
 
-local function dotBtn(xOffset, color)
+local function headBtn(xOffset, text, color)
 	local b = Instance.new("TextButton")
-	b.Size = UDim2.new(0, 18, 0, 18)
-	b.Position = UDim2.new(1, xOffset, 0.5, -9)
+	b.Size = UDim2.new(0, 26, 0, 26)
+	b.Position = UDim2.new(1, xOffset, 0.5, -13)
 	b.BackgroundColor3 = color
-	b.Text = ""
+	b.Text = text
+	b.Font = Enum.Font.GothamBlack
+	b.TextSize = 18
+	b.TextColor3 = C.bg
 	b.AutoButtonColor = true
 	b.BorderSizePixel = 0
+	b.ZIndex = 3
 	b.Parent = title
-	corner(b, 9)
+	corner(b, 8)
 	return b
 end
-local minBtn = dotBtn(-48, C.warn)
-local closeBtn = dotBtn(-26, C.bad)
+local minBtn = headBtn(-92, "-", C.warn)     -- يغلق القائمة
+local plusBtn = headBtn(-62, "+", C.good)    -- يفتح القائمة
+local closeBtn = headBtn(-32, "x", C.bad)    -- يطفي السكربت
+
+-- جسم القائمة (كل شي تحت الشريط)
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.Position = UDim2.new(0, 0, 0, HEAD_H)
+body.Size = UDim2.new(1, 0, 1, -HEAD_H)
+body.BackgroundTransparency = 1
+body.Parent = main
 
 -- عداد القنبلة
 local meter = Instance.new("Frame")
-meter.Position = UDim2.new(0, 8, 0, 42)
-meter.Size = UDim2.new(1, -16, 0, 54)
+meter.Position = UDim2.new(0, 8, 0, 2)
+meter.Size = UDim2.new(1, -16, 0, 62)
 meter.BackgroundColor3 = C.card
 meter.BorderSizePixel = 0
-meter.Parent = main
-corner(meter, 8)
+meter.Parent = body
+corner(meter, 10)
+addStroke(meter, C.line, 1, 0)
+
+local meterStrip = Instance.new("Frame")
+meterStrip.Position = UDim2.new(0, 6, 0, 8)
+meterStrip.Size = UDim2.new(0, 4, 1, -16)
+meterStrip.BackgroundColor3 = C.good
+meterStrip.BorderSizePixel = 0
+meterStrip.Parent = meter
+corner(meterStrip, 2)
 
 local stateText = label(meter, "SAFE", 13, C.good, Enum.Font.GothamBlack)
-stateText.Position = UDim2.new(0, 10, 0, 4)
-stateText.Size = UDim2.new(1, -80, 0, 18)
+stateText.Position = UDim2.new(0, 18, 0, 5)
+stateText.Size = UDim2.new(1, -100, 0, 18)
 local timeText = label(meter, "--", 16, C.text, Enum.Font.GothamBlack)
 timeText.TextXAlignment = Enum.TextXAlignment.Right
-timeText.Position = UDim2.new(1, -74, 0, 3)
-timeText.Size = UDim2.new(0, 64, 0, 20)
+timeText.Position = UDim2.new(1, -84, 0, 4)
+timeText.Size = UDim2.new(0, 74, 0, 20)
 
 local barTrack = Instance.new("Frame")
-barTrack.Position = UDim2.new(0, 10, 0, 27)
-barTrack.Size = UDim2.new(1, -20, 0, 8)
+barTrack.Position = UDim2.new(0, 18, 0, 29)
+barTrack.Size = UDim2.new(1, -30, 0, 8)
 barTrack.BackgroundColor3 = C.bg
 barTrack.BorderSizePixel = 0
 barTrack.Parent = meter
@@ -1375,9 +1693,9 @@ barFill.BorderSizePixel = 0
 barFill.Parent = barTrack
 corner(barFill, 4)
 
-local infoText = label(meter, "STYLE: -  ·  URGENCY: 0%", 10, C.sub, Enum.Font.GothamMedium)
-infoText.Position = UDim2.new(0, 10, 0, 38)
-infoText.Size = UDim2.new(1, -20, 0, 12)
+local infoText = label(meter, "STYLE: -  ·  URG: 0%  ·  JUMP: -", 10, C.sub, Enum.Font.GothamMedium)
+infoText.Position = UDim2.new(0, 18, 0, 42)
+infoText.Size = UDim2.new(1, -30, 0, 14)
 
 setMeter = function(who, whoColor, tleft, urg, styleName)
 	stateText.Text = who
@@ -1387,20 +1705,23 @@ setMeter = function(who, whoColor, tleft, urg, styleName)
 	timeText.TextColor3 = tleft and col or C.sub
 	local ratio = tleft and math.clamp(tleft / math.max(State.peak, 10), 0, 1) or 0
 	tween(barFill, 0.12, { Size = UDim2.new(ratio, 0, 1, 0), BackgroundColor3 = col })
-	infoText.Text = string.format("STYLE: %s  ·  URGENCY: %d%%", styleName ~= "" and styleName or "-", math.floor(urg * 100))
+	tween(meterStrip, 0.2, { BackgroundColor3 = whoColor })
+	local _, _, mh = getCharacterParts(LP)
+	local jtxt = (mh and canJump(mh)) and "ON" or "OFF"
+	infoText.Text = string.format("STYLE: %s  ·  URG: %d%%  ·  JUMP: %s", styleName ~= "" and styleName or "-", math.floor(urg * 100), jtxt)
 end
 
 -- Toast
 local toastBox = Instance.new("Frame")
 toastBox.AnchorPoint = Vector2.new(0.5, 1)
 toastBox.Position = UDim2.new(0.5, 0, 1, -8)
-toastBox.Size = UDim2.new(1, -24, 0, 26)
+toastBox.Size = UDim2.new(1, -24, 0, 28)
 toastBox.BackgroundColor3 = C.bg
 toastBox.BackgroundTransparency = 1
 toastBox.BorderSizePixel = 0
 toastBox.ZIndex = 20
-toastBox.Parent = main
-corner(toastBox, 8)
+toastBox.Parent = body
+corner(toastBox, 9)
 local toastLabel = label(toastBox, "", 12, C.text, Enum.Font.GothamBold)
 toastLabel.Size = UDim2.new(1, 0, 1, 0)
 toastLabel.TextXAlignment = Enum.TextXAlignment.Center
@@ -1422,13 +1743,13 @@ toast = function(text, color)
 	end)
 end
 
--- التبويبات
+-- التبويبات (شريط مع مؤشر متحرك)
 local pages = {}
 local order = 0
 local function newPage()
 	local p = Instance.new("ScrollingFrame")
-	p.Position = UDim2.new(0, 6, 0, 130)
-	p.Size = UDim2.new(1, -12, 1, -164)
+	p.Position = UDim2.new(0, 6, 0, 108)
+	p.Size = UDim2.new(1, -12, 1, -114)
 	p.BackgroundTransparency = 1
 	p.BorderSizePixel = 0
 	p.ScrollBarThickness = 3
@@ -1436,7 +1757,7 @@ local function newPage()
 	p.CanvasSize = UDim2.new()
 	p.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	p.Visible = false
-	p.Parent = main
+	p.Parent = body
 	local lay = Instance.new("UIListLayout")
 	lay.Padding = UDim.new(0, 6)
 	lay.SortOrder = Enum.SortOrder.LayoutOrder
@@ -1452,51 +1773,74 @@ local function newCard(page, h)
 	f.BackgroundColor3 = C.card
 	f.BorderSizePixel = 0
 	f.Parent = page
-	corner(f, 8)
+	corner(f, 10)
+	addStroke(f, C.line, 1, 0.3)
 	return f
+end
+local function makeSection(page, text)
+	order += 1
+	local l = label(page, "  " .. text, 10, C.accent2, Enum.Font.GothamBold)
+	l.Size = UDim2.new(1, -6, 0, 16)
+	l.LayoutOrder = order
 end
 
 local pControl, pTuning, pRadar, pStats = newPage(), newPage(), newPage(), newPage()
 
+local tabBar = Instance.new("Frame")
+tabBar.Position = UDim2.new(0, 8, 0, 72)
+tabBar.Size = UDim2.new(1, -16, 0, 30)
+tabBar.BackgroundColor3 = C.bg
+tabBar.BorderSizePixel = 0
+tabBar.Parent = body
+corner(tabBar, 9)
+
+local tabInd = Instance.new("Frame")
+tabInd.Size = UDim2.new(0.25, -4, 1, -6)
+tabInd.Position = UDim2.new(0, 2, 0, 3)
+tabInd.BackgroundColor3 = Color3.new(1, 1, 1)
+tabInd.BorderSizePixel = 0
+tabInd.Parent = tabBar
+corner(tabInd, 7)
+gradient(tabInd, C.accent, C.accent2, 0)
+
 local tabNames = { "CONTROL", "TUNING", "RADAR", "STATS" }
-local tabBtns, tabLines = {}, {}
+local tabBtns = {}
 local function selectTab(idx)
 	for k, p in ipairs(pages) do p.Visible = (k == idx) end
 	for k, b in ipairs(tabBtns) do
-		b.TextColor3 = (k == idx) and C.text or C.sub
-		tabLines[k].Visible = (k == idx)
+		b.TextColor3 = (k == idx) and Color3.new(1, 1, 1) or C.sub
 	end
+	tween(tabInd, 0.2, { Position = UDim2.new((idx - 1) * 0.25, 2, 0, 3) })
 end
 for i, name in ipairs(tabNames) do
 	local b = Instance.new("TextButton")
-	b.Size = UDim2.new(0.25, -4, 0, 26)
-	b.Position = UDim2.new((i - 1) * 0.25, 2, 0, 100)
+	b.Size = UDim2.new(0.25, 0, 1, 0)
+	b.Position = UDim2.new((i - 1) * 0.25, 0, 0, 0)
 	b.BackgroundTransparency = 1
 	b.Text = name
 	b.Font = Enum.Font.GothamBold
 	b.TextSize = 11
 	b.TextColor3 = C.sub
-	b.Parent = main
-	local line = Instance.new("Frame")
-	line.Size = UDim2.new(0.7, 0, 0, 2)
-	line.Position = UDim2.new(0.15, 0, 1, -2)
-	line.BackgroundColor3 = C.accent2
-	line.BorderSizePixel = 0
-	line.Visible = false
-	line.Parent = b
-	corner(line, 1)
+	b.ZIndex = 2
+	b.Parent = tabBar
 	b.Activated:Connect(function() selectTab(i) end)
-	tabBtns[i], tabLines[i] = b, line
+	tabBtns[i] = b
 end
 
 local function makeToggle(page, name, sub, key, onChange)
-	local row = newCard(page, 44)
+	local row = newCard(page, 46)
+	local strip = Instance.new("Frame")
+	strip.Size = UDim2.new(0, 3, 0, 26)
+	strip.Position = UDim2.new(0, 0, 0.5, -13)
+	strip.BorderSizePixel = 0
+	strip.Parent = row
+	corner(strip, 2)
 	local l = label(row, name, 13, C.text, Enum.Font.GothamBold)
-	l.Position = UDim2.new(0, 12, 0, 5)
-	l.Size = UDim2.new(1, -70, 0, 18)
+	l.Position = UDim2.new(0, 14, 0, 6)
+	l.Size = UDim2.new(1, -76, 0, 18)
 	local s = label(row, sub, 10, C.sub, Enum.Font.Gotham)
-	s.Position = UDim2.new(0, 12, 0, 24)
-	s.Size = UDim2.new(1, -70, 0, 14)
+	s.Position = UDim2.new(0, 14, 0, 25)
+	s.Size = UDim2.new(1, -76, 0, 14)
 
 	local track = Instance.new("TextButton")
 	track.Text = ""
@@ -1517,11 +1861,13 @@ local function makeToggle(page, name, sub, key, onChange)
 		local on = Config[key]
 		local pos = on and UDim2.new(1, -19, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)
 		local col = on and C.accent or C.off
+		local scol = on and C.accent2 or C.off
 		if animate then
 			tween(knob, 0.15, { Position = pos })
 			tween(track, 0.15, { BackgroundColor3 = col })
+			tween(strip, 0.15, { BackgroundColor3 = scol })
 		else
-			knob.Position, track.BackgroundColor3 = pos, col
+			knob.Position, track.BackgroundColor3, strip.BackgroundColor3 = pos, col, scol
 		end
 	end
 	apply(false)
@@ -1534,18 +1880,18 @@ local function makeToggle(page, name, sub, key, onChange)
 end
 
 local function makeSlider(page, name, key, minV, maxV, fmt)
-	local row = newCard(page, 48)
+	local row = newCard(page, 50)
 	local l = label(row, name, 12, C.text, Enum.Font.GothamBold)
-	l.Position = UDim2.new(0, 12, 0, 5)
-	l.Size = UDim2.new(1, -90, 0, 16)
+	l.Position = UDim2.new(0, 14, 0, 6)
+	l.Size = UDim2.new(1, -100, 0, 16)
 	local v = label(row, "", 12, C.accent2, Enum.Font.GothamBold)
 	v.TextXAlignment = Enum.TextXAlignment.Right
-	v.Position = UDim2.new(1, -86, 0, 5)
-	v.Size = UDim2.new(0, 74, 0, 16)
+	v.Position = UDim2.new(1, -90, 0, 6)
+	v.Size = UDim2.new(0, 78, 0, 16)
 
 	local bar = Instance.new("Frame")
-	bar.Size = UDim2.new(1, -24, 0, 12)
-	bar.Position = UDim2.new(0, 12, 0, 28)
+	bar.Size = UDim2.new(1, -28, 0, 12)
+	bar.Position = UDim2.new(0, 14, 0, 29)
 	bar.BackgroundColor3 = C.bg
 	bar.BorderSizePixel = 0
 	bar.Parent = row
@@ -1590,7 +1936,7 @@ local function makeSlider(page, name, key, minV, maxV, fmt)
 end
 
 local function makeButton(page, text, cb)
-	local row = newCard(page, 34)
+	local row = newCard(page, 36)
 	row.BackgroundColor3 = Color3.new(1, 1, 1)
 	gradient(row, C.accent, C.accent2, 0)
 	local b = Instance.new("TextButton")
@@ -1605,6 +1951,7 @@ local function makeButton(page, text, cb)
 end
 
 -- صفحة التحكم
+makeSection(pControl, "CORE")
 makeToggle(pControl, "AI AUTO-PLAY", "لعب تلقائي كامل", "AI", function(on)
 	if not on then
 		local _, hrp, hum = getCharacterParts(LP)
@@ -1613,25 +1960,34 @@ makeToggle(pControl, "AI AUTO-PLAY", "لعب تلقائي كامل", "AI", funct
 	end
 end)
 makeToggle(pControl, "REACH", "تمرير القنبلة عن بعد", "Reach")
+makeToggle(pControl, "AUTO RESTART", "يشتغل تلقائياً كل جولة", "AutoRestart")
+makeSection(pControl, "CAMERA")
 makeToggle(pControl, "SMART SHIFT LOCK", "تثبيت الاتجاه عند الحاجة فقط", "ShiftLock", function(on)
 	if not on then restoreShiftLockState() end
 end)
 makeToggle(pControl, "CAMERA TRACK", "الكاميرا تتبع الهدف", "CamTrack")
+makeSection(pControl, "BRAIN")
 makeToggle(pControl, "TIME CALC", "حساب الوقت وتغيير الأسلوب", "TimeAware")
 makeToggle(pControl, "EDGE ANALYSIS", "تحليل الحافات والزوايا", "EdgeAI")
 makeToggle(pControl, "OPPONENT MEMORY", "يتعلم أسلوب كل خصم", "Memory")
+makeSection(pControl, "MOVEMENT")
 makeToggle(pControl, "SMART NAV", "يتجنب الجدران ويصعد بمسار", "Nav", function() navReset() end)
-makeToggle(pControl, "PARKOUR", "قفز وتسلق واختباء خلف الأعمدة", "Parkour")
-makeToggle(pControl, "AUTO RESTART", "يشتغل تلقائياً كل جولة", "AutoRestart")
+makeToggle(pControl, "PARKOUR", "قفز فوق الحواجز واختباء خلف الأعمدة", "Parkour")
+makeToggle(pControl, "AUTO CLIMB", "يطلع فوق لو الخصم فوق", "Climb")
+makeToggle(pControl, "JUMP DODGES", "مراوغات القفز (إذا الساحة تسمح)", "JumpDodge")
 
 -- صفحة الضبط
+makeSection(pTuning, "TUNING")
 makeSlider(pTuning, "Reach Range", "ReachDistance", 6, 25, function(x) return string.format("%.0f", x) end)
 makeSlider(pTuning, "Reaction Time", "Reaction", 0.05, 0.35, function(x) return string.format("%d ms", x * 1000) end)
 makeSlider(pTuning, "Dodge Aggression", "Aggro", 0, 1, function(x) return string.format("%d%%", x * 100) end)
+makeSlider(pTuning, "Jump Dodge Rate", "JumpRate", 0, 1, function(x) return string.format("%d%%", x * 100) end)
 makeSlider(pTuning, "Urgent Time", "UrgentTime", 2, 8, function(x) return string.format("%.1f s", x) end)
 makeSlider(pTuning, "Tag-back Immunity", "Immunity", 0, 6, function(x) return string.format("%.1f s", x) end)
+makeSection(pTuning, "TOOLS")
 makeButton(pTuning, "RE-SCAN ARENA  •  إعادة تحليل الساحة", function()
 	buildMap()
+	Jump.fails, Jump.blockedUntil = 0, 0
 	toast("Scanning arena...", C.accent2)
 end)
 makeButton(pTuning, "CLEAR MEMORY  •  مسح الذاكرة", function()
@@ -1648,10 +2004,7 @@ radar.BackgroundColor3 = C.bg
 radar.BorderSizePixel = 0
 radar.Parent = radarHolder
 corner(radar, 8)
-local radarStroke = Instance.new("UIStroke")
-radarStroke.Color = C.accent
-radarStroke.Thickness = 1
-radarStroke.Parent = radar
+addStroke(radar, C.accent, 1, 0)
 local radarCells = Instance.new("Frame")
 radarCells.Size = UDim2.new(1, 0, 1, 0)
 radarCells.BackgroundTransparency = 1
@@ -1672,21 +2025,21 @@ local dotMe, dotTarget, dotThreat = makeDot(Color3.new(1, 1, 1), 9), makeDot(C.g
 local dotPool = {}
 for i = 1, 14 do dotPool[i] = makeDot(C.sub, 6) end
 
-local legend = newCard(pRadar, 40)
+local legend = newCard(pRadar, 44)
 local legendText = label(legend, "RED edge  ·  ORANGE near-edge  ·  PINK dead corner\nWHITE you  ·  GREEN target  ·  RED holder", 10, C.sub, Enum.Font.Gotham)
-legendText.Position = UDim2.new(0, 10, 0, 4)
-legendText.Size = UDim2.new(1, -20, 0, 32)
+legendText.Position = UDim2.new(0, 12, 0, 5)
+legendText.Size = UDim2.new(1, -24, 0, 34)
 legendText.TextWrapped = true
 legendText.TextTruncate = Enum.TextTruncate.None
 legendText.TextYAlignment = Enum.TextYAlignment.Top
 
-local profCard = newCard(pRadar, 70)
+local profCard = newCard(pRadar, 72)
 local profLabel = label(profCard, "OPPONENT PROFILE", 11, C.accent2, Enum.Font.GothamBold)
-profLabel.Position = UDim2.new(0, 10, 0, 4)
-profLabel.Size = UDim2.new(1, -20, 0, 14)
+profLabel.Position = UDim2.new(0, 12, 0, 5)
+profLabel.Size = UDim2.new(1, -24, 0, 14)
 local profText = label(profCard, "-", 12, C.text, Enum.Font.GothamMedium)
-profText.Position = UDim2.new(0, 10, 0, 20)
-profText.Size = UDim2.new(1, -20, 0, 46)
+profText.Position = UDim2.new(0, 12, 0, 22)
+profText.Size = UDim2.new(1, -24, 0, 46)
 profText.TextWrapped = true
 profText.TextTruncate = Enum.TextTruncate.None
 profText.TextYAlignment = Enum.TextYAlignment.Top
@@ -1746,82 +2099,54 @@ end
 
 -- صفحة الإحصائيات
 local function makeStat(name)
-	local row = newCard(pStats, 30)
+	local row = newCard(pStats, 32)
 	local l = label(row, name, 12, C.sub, Enum.Font.GothamMedium)
-	l.Position = UDim2.new(0, 12, 0, 0)
+	l.Position = UDim2.new(0, 14, 0, 0)
 	l.Size = UDim2.new(0.5, 0, 1, 0)
 	local v = label(row, "0", 13, C.text, Enum.Font.GothamBold)
 	v.TextXAlignment = Enum.TextXAlignment.Right
 	v.Position = UDim2.new(0.5, 0, 0, 0)
-	v.Size = UDim2.new(0.5, -12, 1, 0)
+	v.Size = UDim2.new(0.5, -14, 1, 0)
 	return v
 end
-local stRounds, stPasses, stMap, stTracked, stSession = makeStat("Rounds"), makeStat("Passes"), makeStat("Arena cells"), makeStat("Opponents tracked"), makeStat("Session")
+local stRounds, stPasses = makeStat("Rounds"), makeStat("Passes")
+local stJumps, stClimbs, stJump = makeStat("Jumps"), makeStat("Climb hops"), makeStat("Jump in this arena")
+local stMap, stTracked, stSession = makeStat("Arena cells"), makeStat("Opponents tracked"), makeStat("Session")
 
--- تصغير: الواجهة تتحول لكرة عائمة (اضغط عليها ترجع) | على الكمبيوتر: RightShift
-local orb = Instance.new("TextButton")
-orb.Size = UDim2.new(0, 46, 0, 46)
-orb.BackgroundColor3 = C.panel
-orb.Text = "AI"
-orb.Font = Enum.Font.GothamBlack
-orb.TextSize = 15
-orb.TextColor3 = C.text
-orb.AutoButtonColor = false
-orb.Visible = false
-orb.ZIndex = 50
-orb.Parent = gui
-corner(orb, 23)
-local orbStroke = Instance.new("UIStroke")
-orbStroke.Thickness = 2
-orbStroke.Color = Color3.new(1, 1, 1)
-orbStroke.Parent = orb
-local orbGrad = gradient(orbStroke, C.accent, C.accent2, 0)
+-- إغلاق (-) وفتح (+) القائمة | على الكمبيوتر: RightShift
+local collapsed = false
+local collapseToken = 0
 
-local minimized = false
-local function setMinimized(state)
-	minimized = state
+local function refreshHeadBtns()
+	tween(minBtn, 0.15, { BackgroundTransparency = collapsed and 0.65 or 0 })
+	tween(plusBtn, 0.15, { BackgroundTransparency = collapsed and 0 or 0.65 })
+end
+
+local function setCollapsed(state)
+	if state == collapsed then return end
+	collapsed = state
+	collapseToken += 1
+	local my = collapseToken
+	refreshHeadBtns()
 	if state then
-		orb.Position = main.Position
-		main.Visible = false
-		orb.Visible = true
+		tween(main, 0.25, { Size = MINI_SIZE })
+		task.delay(0.27, function()
+			if my == collapseToken and collapsed then body.Visible = false end
+		end)
 	else
-		main.Position = orb.Position
-		orb.Visible = false
-		main.Visible = true
-		main.Size = MINI_SIZE
+		body.Visible = true
 		tween(main, 0.3, { Size = FULL_SIZE })
 	end
 end
-minBtn.Activated:Connect(function() setMinimized(true) end)
 
-do
-	local dragging, moved, dragStart, startPos = false, false, nil, nil
-	orb.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging, moved, dragStart, startPos = true, false, input.Position, orb.Position
-			input.Changed:Connect(function()
-				if input.UserInputState == Enum.UserInputState.End then
-					dragging = false
-					if not moved then setMinimized(false) end
-				end
-			end)
-		end
-	end)
-	table.insert(connections, UIS.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-			local d = input.Position - dragStart
-			if d.Magnitude > 8 then moved = true end
-			if moved then
-				orb.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
-			end
-		end
-	end))
-end
+minBtn.Activated:Connect(function() setCollapsed(true) end)
+plusBtn.Activated:Connect(function() setCollapsed(false) end)
 table.insert(connections, UIS.InputBegan:Connect(function(input, processed)
 	if processed then return end
-	if input.KeyCode == Enum.KeyCode.RightShift then setMinimized(not minimized) end
+	if input.KeyCode == Enum.KeyCode.RightShift then setCollapsed(not collapsed) end
 end))
 
+-- سحب القائمة من الشريط
 do
 	local dragging, dragStart, startPos
 	title.InputBegan:Connect(function(input)
@@ -1849,9 +2174,24 @@ local function shutdown()
 	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
 	gui:Destroy()
 end
-closeBtn.Activated:Connect(shutdown)
+
+-- زر الإغلاق يحتاج ضغطتين عشان ما ينطفي بالغلط
+local closeArmed = 0
+closeBtn.Activated:Connect(function()
+	if closeArmed > 0 and now() - closeArmed < 2 then
+		shutdown()
+		return
+	end
+	closeArmed = now()
+	closeBtn.Text = "?"
+	toast("Tap again to close  •  اضغط مرة ثانية للإغلاق", C.warn)
+	task.delay(2, function()
+		if alive and now() - closeArmed >= 1.9 then closeBtn.Text = "x" end
+	end)
+end)
 
 selectTab(1)
+refreshHeadBtns()
 tween(main, 0.45, { Size = FULL_SIZE })
 
 --------------------------------------------------------------------
@@ -1932,6 +2272,12 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 		for _ in pairs(Memory) do n += 1 end
 		stRounds.Text = tostring(Stats.rounds)
 		stPasses.Text = tostring(Stats.passes)
+		stJumps.Text = tostring(Stats.jumps)
+		stClimbs.Text = tostring(Stats.climbs)
+		local _, _, mh = getCharacterParts(LP)
+		local jok = mh ~= nil and canJump(mh)
+		stJump.Text = jok and "YES" or "NO"
+		stJump.TextColor3 = jok and C.good or C.bad
 		stMap.Text = Map.ready and tostring(Map.walk) or "—"
 		stTracked.Text = tostring(n)
 		local s = math.floor(now() - Stats.t0)
@@ -1943,7 +2289,6 @@ RunService:BindToRenderStep("TimebombAI", Enum.RenderPriority.Camera.Value + 1, 
 	if not alive then return end
 	local t = now()
 	strokeGrad.Rotation = (t * 60) % 360
-	orbGrad.Rotation = (t * 90) % 360
 	titleGrad.Offset = Vector2.new(math.sin(t) * 0.15, 0)
 	pcall(camTrack)
 	if Config.ShiftLock then pcall(updateShiftLock) end
