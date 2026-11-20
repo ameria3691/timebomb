@@ -1,4 +1,4 @@
---// TIMEBOMB AI v3 · LEGEND EDITION
+--// TIMEBOMB AI v4 · LEGEND EDITION
 --// Time Calc | Edge Analysis | Opponent Memory | Smart Flee | Dodge Skills | CamTrack | Radar UI
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -18,6 +18,9 @@ local Config = {
 	TimeAware = true,   -- حساب الوقت
 	EdgeAI = true,      -- تحليل الحافات
 	Memory = true,      -- ذاكرة الخصوم
+	Nav = true,         -- ملاحة: تجنب الحواجز + مسار + صعود
+	Parkour = true,     -- قفز/باركور/اختباء خلف الأعمدة
+	Immunity = 2.5,     -- مدة حماية اللي مرر لك (ما تقدر ترجعها له)
 	PassRange = 12,
 	FleeRange = 16.5,
 	ReachDistance = 14,
@@ -52,7 +55,7 @@ local State = {
 	threat = nil, threatDist = math.huge, threatMem = nil,
 	approaching = false, myTime = nil, threatTime = nil,
 	arenaCenter = nil, focus = nil, focusDist = math.huge,
-	peak = 0, lastHT = 0, lockedTarget = nil, dots = {},
+	peak = 0, lastHT = 0, lockedTarget = nil, dots = {}, lastThreat = nil, lastThreatT = 0, stalk = nil,
 }
 local Style = { mode = "", name = "", untilT = 0, phaseT = 0, dir = 1, period = 0.4, cache = nil, cacheT = 0, lastSide = 0 }
 local Stats = { rounds = 0, passes = 0, t0 = os.clock() }
@@ -224,6 +227,304 @@ local function hasFloorAt(p)
 	rayParams.FilterDescendantsInstances = { LP.Character }
 	local res = Workspace:Raycast(p + Vector3.new(0, 3, 0), Vector3.new(0, -40, 0), rayParams)
 	return res ~= nil and not looksLikeLobby(res.Instance)
+end
+
+--------------------------------------------------------------------
+-- العوائق والملاحة (Pathfinding) + القفز والتسلق + حماية التمرير
+--------------------------------------------------------------------
+local PathfindingService = game:GetService("PathfindingService")
+local Immune = {} -- لاعبين ما تقدر تمرر لهم فوراً (بعد ما مرروا لك)
+
+local function immuneRemaining(plr)
+	local rem = (Immune[plr.UserId] or 0) - now()
+	return rem > 0 and rem or 0
+end
+
+local function isImmune(plr)
+	local rem = immuneRemaining(plr)
+	if rem <= 0 then return false end
+	if State.myTime and State.myTime <= rem then return false end -- ما بقي وقت: جرّب على أي حال
+	return true
+end
+
+local charCache, charCacheT = {}, 0
+local function charList()
+	if now() - charCacheT > 0.3 then
+		charCache = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p.Character then charCache[#charCache + 1] = p.Character end
+		end
+		charCacheT = now()
+	end
+	return charCache
+end
+
+-- راي يتجاهل اللاعبين والأجزاء اللي ما فيها تصادم، ويوقف عند أي حاجز حقيقي (حتى الجدران الشفافة)
+local hardParams = RaycastParams.new()
+hardParams.FilterType = Enum.RaycastFilterType.Exclude
+local function castHard(origin, vec)
+	local ignore = table.clone(charList())
+	for _ = 1, 4 do
+		hardParams.FilterDescendantsInstances = ignore
+		local res = Workspace:Raycast(origin, vec, hardParams)
+		if not res then return nil end
+		if res.Instance.CanCollide then return res end
+		ignore[#ignore + 1] = res.Instance
+	end
+	return nil
+end
+
+-- هل الطريق من نقطة لنقطة مفتوح (رجل + وسط + راس)؟
+local function clearLine(from, to)
+	local vec = to - from
+	for _, h in ipairs({ -1.5, 0, 1.6 }) do
+		local o = Vector3.new(from.X, from.Y + h, from.Z)
+		if castHard(o, vec) then return false end
+	end
+	return true
+end
+
+local function jumpHeightOf(hum)
+	if hum.UseJumpPower then
+		local jp = hum.JumpPower
+		return jp * jp / (2 * Workspace.Gravity)
+	end
+	return hum.JumpHeight
+end
+
+local lastJump = 0
+local function forceJump(hum)
+	if now() - lastJump < 0.35 then return end
+	lastJump = now()
+	hum.Jump = true
+end
+
+local function tryJump(hum, chance)
+	if now() - lastJump > 0.9 and rng:NextNumber() < chance then
+		lastJump = now()
+		hum.Jump = true
+	end
+end
+
+-- حاجز واطي قدامك تقدر تقفز فوقه؟
+local function ledgeAhead(hrp, hum, dir)
+	dir = unit(flat(dir))
+	local feetY = hrp.Position.Y - (hum.HipHeight + hrp.Size.Y / 2)
+	local px, pz = hrp.Position.X, hrp.Position.Z
+	local low = castHard(Vector3.new(px, feetY + 0.8, pz), dir * 3.5)
+	if not low then return false end
+	local jh = math.max(jumpHeightOf(hum) - 0.6, 2)
+	local high = castHard(Vector3.new(px, feetY + jh + 1.2, pz), dir * 3.5)
+	return high == nil
+end
+
+-- أقرب اتجاه مفتوح للاتجاه المطلوب (يلف حول الجدران)
+local STEER_ANGLES = { 0, 25, -25, 50, -50, 80, -80, 120, -120, 160 }
+local function steerDir(hrp, dir, dist)
+	dir = unit(flat(dir))
+	dist = dist or 6
+	for _, ang in ipairs(STEER_ANGLES) do
+		local d = unit((CFrame.Angles(0, math.rad(ang), 0) * CFrame.new(dir)).Position)
+		local to = hrp.Position + d * dist
+		if clearLine(hrp.Position, to) and hasFloorAt(to) then return d end
+	end
+	return nil
+end
+
+local Nav = {
+	wps = nil, idx = 1, goal = nil, computing = false, lastT = 0,
+	lastPos = nil, lastCheck = 0, lastCall = 0, escapeUntil = 0, escapeDir = Vector3.new(0, 0, 1),
+}
+
+local function navReset()
+	Nav.wps, Nav.idx, Nav.goal = nil, 1, nil
+	Nav.lastPos, Nav.escapeUntil = nil, 0
+end
+
+-- كشف التعليق: إذا ما تحرك، يقفز ويتحرك جانباً ويعيد حساب المسار
+local function stuckCheck(hrp, hum, to)
+	local t = now()
+	if t - Nav.lastCall > 1 then Nav.lastPos = nil end
+	Nav.lastCall = t
+	if Nav.escapeUntil > t then
+		hum:MoveTo(hrp.Position + Nav.escapeDir * 8)
+		return true
+	end
+	if not Nav.lastPos or t - Nav.lastCheck > 0.5 then
+		if Nav.lastPos and (hrp.Position - Nav.lastPos).Magnitude < 0.8 and flat(to).Magnitude > 4 then
+			forceJump(hum)
+			Nav.wps = nil
+			Nav.lastT = 0
+			Nav.escapeUntil = t + 0.45
+			Nav.escapeDir = perp(unit(flat(to))) * (rng:NextInteger(0, 1) == 0 and 1 or -1)
+		end
+		Nav.lastPos, Nav.lastCheck = hrp.Position, t
+	end
+	return false
+end
+
+local function navCompute(hrp, goal)
+	if Nav.computing or now() - Nav.lastT < 0.45 then return end
+	Nav.computing, Nav.lastT = true, now()
+	local from = hrp.Position
+	task.spawn(function()
+		local ok = pcall(function()
+			local path = PathfindingService:CreatePath({
+				AgentRadius = 2.2, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = false, WaypointSpacing = 4,
+			})
+			path:ComputeAsync(from, goal)
+			if path.Status == Enum.PathStatus.Success then
+				Nav.wps = path:GetWaypoints()
+				Nav.idx = 2
+				Nav.goal = goal
+			else
+				Nav.wps = nil
+			end
+		end)
+		if not ok then Nav.wps = nil end
+		Nav.computing = false
+	end)
+end
+
+-- حركة ذكية للمطاردة: تتجنب الجدران، تقفز على الحواجز الواطية، وتستخدم مسار للصعود والالتفاف
+local function navMove(hrp, hum, goal)
+	local pos = hrp.Position
+	local to = goal - pos
+	local flatD = flat(to).Magnitude
+	if flatD < 0.5 then hum:MoveTo(pos) return end
+	if stuckCheck(hrp, hum, to) then return end
+	if not Config.Nav then hum:MoveTo(goal) return end
+
+	local dirG = unit(flat(to))
+
+	if Config.Parkour and flatD > 1.5 and ledgeAhead(hrp, hum, dirG) then
+		forceJump(hum)
+		hum:MoveTo(pos + dirG * 8)
+		return
+	end
+
+	local dy = goal.Y - pos.Y
+	local direct = math.abs(dy) < 4 and clearLine(pos, Vector3.new(goal.X, pos.Y, goal.Z))
+	if direct then
+		Nav.wps = nil
+		local sd = steerDir(hrp, dirG, 7) or dirG
+		hum:MoveTo(pos + sd * 10)
+		return
+	end
+
+	-- في حاجز أو الهدف فوق: مسار
+	if not Nav.wps or not Nav.goal or flat(Nav.goal - goal).Magnitude > 6 then
+		navCompute(hrp, goal)
+	end
+	local wps = Nav.wps
+	if wps then
+		while wps[Nav.idx] and flat(wps[Nav.idx].Position - pos).Magnitude < 3.2 and math.abs(wps[Nav.idx].Position.Y - pos.Y) < 5 do
+			Nav.idx += 1
+		end
+		local wp = wps[Nav.idx]
+		if wp then
+			if wp.Action == Enum.PathWaypointAction.Jump and flat(wp.Position - pos).Magnitude < 7 then forceJump(hum) end
+			hum:MoveTo(wp.Position)
+			return
+		end
+		Nav.wps = nil
+	end
+
+	-- ما في مسار جاهز: توجيه مباشر حول الحواجز
+	local sd = steerDir(hrp, dirG, 8)
+	if sd then
+		hum:MoveTo(pos + sd * 10)
+	else
+		forceJump(hum)
+		hum:MoveTo(pos + perp(dirG) * 8)
+	end
+end
+
+-- حركة الهروب: توجيه حول الحواجز + قفز فوق الحواجز الواطية (باركور)
+local function steerMove(hrp, hum, p)
+	local pos = hrp.Position
+	local dirv = flat(p - pos)
+	if dirv.Magnitude < 0.5 then hum:MoveTo(pos) return end
+	if stuckCheck(hrp, hum, dirv) then return end
+	local dir = unit(dirv)
+	if Config.Parkour and ledgeAhead(hrp, hum, dir) then
+		forceJump(hum)
+		hum:MoveTo(pos + dir * 8)
+		return
+	end
+	local sd = Config.Nav and steerDir(hrp, dir, 7) or dir
+	hum:MoveTo(pos + (sd or dir) * 10)
+end
+
+-- عمود/جدار قريب تختبئ وراه وتدور حوله
+local pillarCache, pillarT = nil, 0
+local function findPillar(hrp)
+	if now() - pillarT < 0.7 then return pillarCache end
+	pillarT = now()
+	pillarCache = nil
+	local best, bestD = nil, 1e9
+	for a = 0, 315, 45 do
+		local dir = Vector3.new(math.cos(math.rad(a)), 0, math.sin(math.rad(a)))
+		local res = castHard(hrp.Position, dir * 24)
+		if res and res.Distance > 3 and res.Normal.Y < 0.5 then
+			local inst = res.Instance
+			if inst:IsA("BasePart") and not inst:IsA("Terrain") and inst.Size.Y >= 5
+				and math.max(inst.Size.X, inst.Size.Z) <= 70 and res.Distance < bestD then
+				best, bestD = inst, res.Distance
+			end
+		end
+	end
+	if best then pillarCache = { part = best, center = best.Position, size = best.Size } end
+	return pillarCache
+end
+
+local function coverPoint(hrp, thrp, pl)
+	local c = Vector3.new(pl.center.X, hrp.Position.Y, pl.center.Z)
+	local away = unit(flat(c - thrp.Position))
+	local r = math.max(pl.size.X, pl.size.Z) / 2 + 4.5
+	return c + away * r
+end
+
+-- حافة/منصة قريبة تقدر تقفز عليها للهروب لفوق
+local function findLedge(hrp, hum, thrp)
+	local jh = math.max(jumpHeightOf(hum) - 0.6, 2)
+	local feetY = hrp.Position.Y - (hum.HipHeight + hrp.Size.Y / 2)
+	local px, pz = hrp.Position.X, hrp.Position.Z
+	local best, bestScore
+	for a = 0, 315, 45 do
+		local dir = Vector3.new(math.cos(math.rad(a)), 0, math.sin(math.rad(a)))
+		local low = castHard(Vector3.new(px, feetY + 0.8, pz), dir * 12)
+		if low and low.Normal.Y < 0.5 and low.Distance > 1 then
+			local high = castHard(Vector3.new(px, feetY + jh + 1.2, pz), dir * (low.Distance + 3))
+			if not high then
+				local topO = low.Position + dir * 2 + Vector3.new(0, jh + 3, 0)
+				local top = castHard(topO, Vector3.new(0, -(jh + 3.8), 0))
+				if top and top.Position.Y > feetY + 1.2 and top.Position.Y < feetY + jh + 0.3 then
+					local score = (thrp and flat(low.Position - thrp.Position).Magnitude or 0) - low.Distance
+					if not best or score > bestScore then
+						best, bestScore = { point = low.Position - dir * 1.5, dir = dir }, score
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function nearestEnemy(maxD)
+	local _, myHrp = getCharacterParts(LP)
+	if not myHrp then return nil end
+	local best, bd = nil, maxD
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if not isTeammate(plr) then
+			local _, hrp = getCharacterParts(plr)
+			if hrp then
+				local d = (hrp.Position - myHrp.Position).Magnitude
+				if d < bd then best, bd = plr, d end
+			end
+		end
+	end
+	return best
 end
 
 --------------------------------------------------------------------
@@ -471,12 +772,21 @@ local function clearState()
 end
 
 local function chooseTarget(cands, myHum)
+	State.stalk = nil
 	if #cands == 0 then return nil end
 	local u = urgencyOf(State.myTime)
 	local speed = math.max(myHum and myHum.WalkSpeed or 16, 8)
 	local best, bestScore
+	local _, mh = getCharacterParts(LP)
+	local myY = mh and mh.Position.Y or 0
 	for _, c in ipairs(cands) do
 		local s
+		local rem = immuneRemaining(c.plr)
+		if rem > 0 and c.d / speed < rem and not (State.myTime and State.myTime <= rem) then
+			-- محمي مؤقتاً: لا تروح له الحين، دوّر حوله
+			if not State.stalk or c.d < State.stalk.d then State.stalk = c end
+			continue
+		end
 		if u > 0.7 then
 			-- وقت ضيق: أسرع هدف يوصله
 			s = -c.d * 2 - c.m.erratic * 3
@@ -498,9 +808,11 @@ local function chooseTarget(cands, myHum)
 			local eta = c.d / speed
 			if eta > State.myTime * 0.9 then s -= (eta - State.myTime * 0.9) * 10 end
 		end
+		s -= math.max(c.hrp.Position.Y - myY, 0) * 0.6 -- الأهداف العالية أصعب
 		if State.lockedTarget == c.plr then s += 6 end
 		if not best or s > bestScore then best, bestScore = c, s end
 	end
+	if not best then return nil end
 	State.lockedTarget = best.plr
 	return best
 end
@@ -544,6 +856,7 @@ local function scanPlayers()
 		end
 		updatePeak(State.myTime)
 	elseif State.threat then
+		State.lastThreat, State.lastThreatT = State.threat, now()
 		State.threatTime = getRemainingBombTime(State.threat)
 		updatePeak(State.threatTime)
 		local _, h = getCharacterParts(State.threat)
@@ -594,6 +907,7 @@ local function bestEscapePoint(hrp, thrp)
 			local towards = dir:Dot(toThreat)
 			if towards > 0.2 then score -= towards * 25 end
 			score += rng:NextNumber(0, 4)
+			if Config.Nav and not clearLine(hrp.Position, p) then score -= 200 end
 		end
 		if score > bestScore then best, bestScore = p, score end
 	end
@@ -604,13 +918,30 @@ local function bestEscapePoint(hrp, thrp)
 end
 
 --------------------------------------------------------------------
--- المراوغات والمطاردة
+-- المراوغات والمطاردة (مهارات كثيرة + ملاحة)
 --------------------------------------------------------------------
-local function pickFleeStyle(d, forceSide, m)
+local function pickWeighted(list)
+	local sum = 0
+	for _, e in ipairs(list) do sum += e[2] end
+	local r = rng:NextNumber() * sum
+	for _, e in ipairs(list) do
+		r -= e[2]
+		if r <= 0 then return e[1] end
+	end
+	return list[#list][1]
+end
+
+local FLEE_DUR = {
+	smart = { 0.6, 1.4 }, zigzag = { 1.0, 2.0 }, circle = { 1.0, 2.0 }, feint = { 0.7, 0.7 },
+	brake = { 0.6, 0.6 }, kite = { 1.0, 2.0 }, juke = { 0.9, 0.9 }, bhop = { 1.0, 1.8 },
+	pillar = { 1.2, 2.5 }, hop = { 1.2, 1.2 },
+}
+
+local function pickFleeStyle(ctx, d, forceSide, m)
 	local t = now()
 	local k = 1.5 - Config.Aggro
 	local uh = urgencyOf(State.threatTime)
-	Style.mode, Style.phaseT, Style.cache = "flee", t, nil
+	Style.mode, Style.phaseT, Style.cache, Style.data = "flee", t, nil, nil
 	Style.dir = rng:NextInteger(0, 1) == 0 and 1 or -1
 	Style.period = rng:NextNumber(0.25, 0.6)
 	local dur
@@ -622,51 +953,103 @@ local function pickFleeStyle(d, forceSide, m)
 			Style.dir = (m.bias > 0) and -1 or 1 -- عكس ميله
 		end
 	else
-		local r = rng:NextNumber()
-		if Config.Memory and m and m.erratic > 0.3 then r *= 0.5 end
-		if Config.TimeAware then
-			if uh < 0.3 and d > 12 then
-				r *= 0.35                -- حامل هادي: ابقَ ذكي وبعيد
-			elseif uh > 0.7 and d > 9 then
-				r = 0.32 + r * 0.53      -- حامل مستعجل: زجزاج/دوران/خدعة
-			end
+		local last2 = State.threatTime ~= nil and State.threatTime <= 2.5
+		local pillar = Config.Parkour and findPillar(ctx.hrp) or nil
+		local ledge = Config.Parkour and findLedge(ctx.hrp, ctx.hum, ctx.thrp) or nil
+		local list
+		if last2 then
+			-- آخر ثواني: لا تخليه يمررها لك
+			list = { { "kite", 3 }, { "juke", 2 }, { "sidestep", 1 } }
+			if pillar then list[#list + 1] = { "pillar", 2 } end
+			if ledge then list[#list + 1] = { "hop", 2 } end
+		elseif Config.TimeAware and uh > 0.7 then
+			list = { { "kite", 2 }, { "zigzag", 1.2 }, { "circle", 1 }, { "juke", 1.5 }, { "bhop", 1 } }
+			if d > 9 then list[#list + 1] = { "feint", 1.2 } end
+			if pillar then list[#list + 1] = { "pillar", 2 } end
+			if ledge then list[#list + 1] = { "hop", 1.5 } end
+		elseif Config.TimeAware and uh < 0.3 and d > 12 then
+			list = { { "smart", 3 }, { "kite", 2.5 }, { "circle", 1 } }
+			if pillar then list[#list + 1] = { "pillar", 1.5 } end
+		else
+			list = { { "smart", 2 }, { "zigzag", 1.4 }, { "circle", 1.2 }, { "brake", 0.8 }, { "kite", 1 }, { "juke", 0.8 }, { "bhop", 0.8 } }
+			if d > 9 then list[#list + 1] = { "feint", 1 } end
+			if pillar then list[#list + 1] = { "pillar", 1.4 } end
+			if ledge then list[#list + 1] = { "hop", 1 } end
 		end
-		if r < 0.32 then Style.name, dur = "smart", rng:NextNumber(0.6, 1.4)
-		elseif r < 0.52 then Style.name, dur = "zigzag", rng:NextNumber(1.0, 2.0)
-		elseif r < 0.70 then Style.name, dur = "circle", rng:NextNumber(1.0, 2.0)
-		elseif r < 0.85 and d > 9 then Style.name, dur = "feint", 0.7
-		else Style.name, dur = "brake", 0.6 end
+		if Config.Memory and m and m.erratic > 0.3 then list[#list + 1] = { "smart", 2 } end
+
+		Style.name = pickWeighted(list)
+		if Style.name == "sidestep" then Style.lastSide = t end
+		if Style.name == "pillar" then Style.data = pillar elseif Style.name == "hop" then Style.data = ledge end
+		local dr = FLEE_DUR[Style.name] or { 0.6, 1.2 }
+		dur = rng:NextNumber(dr[1], dr[2])
+		if last2 then dur *= 0.6 end
 	end
 	Style.untilT = t + dur * k
 end
 
-local function fleePoint(hrp, thrp, d)
-	local away = unit(flat(hrp.Position - thrp.Position))
+local function fleePoint(hrp, hum, thrp, d)
+	local pos = hrp.Position
+	local away = unit(flat(pos - thrp.Position))
 	local el = now() - Style.phaseT
 	local n = Style.name
 	local p
+
 	if n == "smart" then
+		return bestEscapePoint(hrp, thrp)
+	elseif n == "bhop" then
+		tryJump(hum, 0.9)
 		return bestEscapePoint(hrp, thrp)
 	elseif n == "zigzag" then
 		local side = (math.floor(el / Style.period) % 2 == 0) and 1 or -1
-		p = hrp.Position + unit(away + perp(away) * side * 1.1) * 12
+		p = pos + unit(away + perp(away) * side * 1.1) * 12
 	elseif n == "circle" then
-		p = hrp.Position + unit(perp(away) * Style.dir + away * 0.35) * 12
+		p = pos + unit(perp(away) * Style.dir + away * 0.35) * 12
 	elseif n == "feint" then
 		if el < 0.25 then
-			p = hrp.Position + unit(perp(away) * Style.dir - away * 0.4) * 10
+			p = pos + unit(perp(away) * Style.dir - away * 0.4) * 10
 		else
-			p = hrp.Position + unit(perp(away) * -Style.dir + away * 0.9) * 14
+			p = pos + unit(perp(away) * -Style.dir + away * 0.9) * 14
 		end
 	elseif n == "brake" then
-		if el < 0.22 then return hrp.Position end
+		if el < 0.22 then return pos end
 		return bestEscapePoint(hrp, thrp)
 	elseif n == "sidestep" then
 		local v = unit(flat(thrp.AssemblyLinearVelocity))
-		p = hrp.Position + unit(perp(v) * Style.dir + away * 0.4) * 12
+		p = pos + unit(perp(v) * Style.dir + away * 0.4) * 12
+	elseif n == "kite" then
+		-- يدور حوله بمسافة آمنة (برا مدى الريتش)
+		local rot = (CFrame.Angles(0, math.rad(35 * Style.dir), 0) * CFrame.new(away)).Position
+		local q = thrp.Position + unit(rot) * 20
+		p = Vector3.new(q.X, pos.Y, q.Z)
+	elseif n == "juke" then
+		-- 3 قلبات سريعة ثم اندفاع جانبي
+		local side
+		if el < 0.15 then side = 1 elseif el < 0.3 then side = -1 elseif el < 0.45 then side = 1 end
+		if side then
+			p = pos + unit(perp(away) * side * Style.dir + away * 0.3) * 10
+		else
+			p = pos + unit(perp(away) * -Style.dir + away) * 14
+		end
+	elseif n == "pillar" then
+		local pl = Style.data
+		if pl and pl.part and pl.part.Parent then
+			local cp = coverPoint(hrp, thrp, pl)
+			if hasFloorAt(cp) then return cp end
+		end
+		return bestEscapePoint(hrp, thrp)
+	elseif n == "hop" then
+		local lg = Style.data
+		if lg then
+			local lp = Vector3.new(lg.point.X, pos.Y, lg.point.Z)
+			if flat(lp - pos).Magnitude < 2.5 then return pos + lg.dir * 8 end
+			return lp
+		end
+		return bestEscapePoint(hrp, thrp)
 	else
 		return bestEscapePoint(hrp, thrp)
 	end
+
 	local cell = Config.EdgeAI and cellAt(p) or nil
 	if not hasFloorAt(p) or (cell and (not cell.walk or cell.corner)) then
 		return bestEscapePoint(hrp, thrp)
@@ -677,33 +1060,25 @@ end
 local function pickChaseStyle()
 	local t = now()
 	local k = 1.5 - Config.Aggro
-	Style.mode, Style.phaseT = "chase", t
+	Style.mode, Style.phaseT, Style.data = "chase", t, nil
 	Style.dir = rng:NextInteger(0, 1) == 0 and 1 or -1
 	local u = urgencyOf(State.myTime)
-	local dur = rng:NextNumber(0.8, 1.4)
-	local r = rng:NextNumber()
-
-	if Config.EdgeAI and State.targetEdge and State.targetEdge <= 16 and r < 0.5 then
-		Style.name = "pin" -- الهدف قرب الحافة: حاصره
+	local list
+	if Config.EdgeAI and State.targetEdge and State.targetEdge <= 16 then
+		list = { { "pin", 3 }, { "direct", 1 }, { "cutoff", 1 }, { "stutter", 0.6 } }
+	elseif u < 0.3 then
+		list = { { "flank", 2 }, { "feint", 2 }, { "cutoff", 1.5 }, { "arc", 1.5 }, { "bait", 1.2 }, { "stutter", 1.2 }, { "mirror", 1.5 }, { "hopchase", 0.8 }, { "direct", 1 } }
 	else
-		r = rng:NextNumber()
-		if u < 0.3 then -- وقت مريح: صبر وخدع
-			if r < 0.3 then Style.name = "flank"
-			elseif r < 0.6 then Style.name = "feint"
-			elseif r < 0.8 then Style.name = "cutoff"
-			else Style.name = "direct" end
-		else
-			if r < 0.5 then Style.name = "direct"
-			elseif r < 0.75 then Style.name = "cutoff"
-			elseif r < 0.9 then Style.name = "flank"
-			else Style.name = "feint" end
-		end
+		list = { { "direct", 3 }, { "cutoff", 2 }, { "flank", 1.2 }, { "arc", 1.2 }, { "feint", 1 }, { "mirror", 0.8 }, { "hopchase", 0.8 } }
 	end
-	if Style.name == "feint" then dur = 0.8 end
+	Style.name = pickWeighted(list)
+	local dur = rng:NextNumber(0.8, 1.5)
+	if Style.name == "feint" or Style.name == "bait" then dur = 0.8 end
 	Style.untilT = t + dur * k
 end
 
 local function chasePoint(hrp, thrp, d, m)
+	local pos = hrp.Position
 	local tpos = thrp.Position
 	local tvel = flat(thrp.AssemblyLinearVelocity)
 	local lead = math.clamp(d / 16, 0, 0.8)
@@ -711,13 +1086,15 @@ local function chasePoint(hrp, thrp, d, m)
 
 	-- ذاكرة الخصم: يعدّل التوقع حسب ميله وتوقفه
 	if Config.Memory and m and m.time > 3 then
-		local u = unit(flat(hrp.Position - tpos))
-		predicted += perp(u) * m.bias * lead * m.speed * 0.5
+		local uu = unit(flat(pos - tpos))
+		predicted += perp(uu) * m.bias * lead * m.speed * 0.5
 		if m.stop > 0.4 then predicted = tpos + (predicted - tpos) * 0.5 end
 	end
 
 	local el = now() - Style.phaseT
 	local n = Style.name
+	local toT = unit(flat(tpos - pos))
+
 	if n == "flank" then
 		local back = -unit(flat(thrp.CFrame.LookVector))
 		if d > 7 then return predicted + back * 5 + perp(back) * Style.dir * 3 end
@@ -725,70 +1102,95 @@ local function chasePoint(hrp, thrp, d, m)
 		return tpos + tvel * math.clamp(d / 10, 0.3, 1.1)
 	elseif n == "feint" then
 		if d > 7 and el < 0.3 then
-			return hrp.Position + unit(perp(flat(tpos - hrp.Position)) * Style.dir) * 8
+			return pos + unit(perp(toT) * Style.dir) * 8
 		end
 	elseif n == "pin" then
 		local center = getCenter()
 		if center then
 			local inward = unit(flat(center - tpos))
-			local imInside = flat(center - hrp.Position).Magnitude < flat(center - tpos).Magnitude
+			local imInside = flat(center - pos).Magnitude < flat(center - tpos).Magnitude
 			if imInside then return predicted + inward * 3 end
-			return tpos + inward * 7 + perp(inward) * Style.dir * 6 -- لف للجهة الداخلية أول
+			return tpos + inward * 7 + perp(inward) * Style.dir * 6
+		end
+	elseif n == "stutter" then
+		-- وقف/انطلق عشان يخرب توقيت مراوغته
+		if (el % 0.55) < 0.16 and d > 8 then return pos end
+	elseif n == "mirror" then
+		-- يوازي حركته الجانبية ثم ينقض
+		if d > 8 and el < 0.7 then
+			local lat = tvel:Dot(perp(toT))
+			local sgn = lat >= 0 and 1 or -1
+			return pos + unit(toT * 0.5 + perp(toT) * sgn * 0.9) * 10
+		end
+	elseif n == "arc" then
+		return predicted + perp(toT) * Style.dir * math.clamp(d * 0.5, 0, 8)
+	elseif n == "bait" then
+		-- يتراجع شوي عشان يستفزه ثم ينقض
+		if el < 0.35 and d > 8 then
+			local q = pos - toT * 8
+			if hasFloorAt(q) then return q end
 		end
 	end
 	return predicted
 end
 
-local function safeDirection(hrp, dir)
-	for _, angle in ipairs({ 0, 50, -50, 100, -100, 150, -150 }) do
-		local d = unit((CFrame.Angles(0, math.rad(angle), 0) * CFrame.new(dir)).Position)
-		local cell = Config.EdgeAI and cellAt(hrp.Position + d * 7) or nil
-		if hasFloorAt(hrp.Position + d * 7) and not (cell and not cell.walk) then return d end
-	end
-	return unit(dir)
-end
-
-local lastJump = 0
-local function tryJump(hum, chance)
-	if now() - lastJump > 0.9 and rng:NextNumber() < chance then
-		lastJump = now()
-		hum.Jump = true
-	end
-end
-
 local function resetAI()
-	Style.mode, Style.name, Style.untilT, Style.cache = "", "", 0, nil
+	Style.mode, Style.name, Style.untilT, Style.cache, Style.data = "", "", 0, nil, nil
 	State.peak, State.lastHT, State.lockedTarget = 0, 0, nil
+	navReset()
 end
 
 local function aiStep()
 	local _, hrp, hum = getCharacterParts(LP)
 	if not hrp then return end
 	local t = now()
+	local pos = hrp.Position
 
 	if hasBomb(LP) then
 		local tg = State.target
-		if not tg then hum:MoveTo(hrp.Position) return end
+		if not tg then
+			local sk = State.stalk
+			if sk then
+				-- كل الخصوم محميين مؤقتاً: دوّر حول أقربهم بدون ما تلمسه لين تنتهي الحماية
+				if Style.mode ~= "stalk" then
+					Style.mode, Style.name = "stalk", "stalk"
+					Style.dir = rng:NextInteger(0, 1) == 0 and 1 or -1
+					Style.untilT = t + rng:NextNumber(1.5, 3)
+				elseif t > Style.untilT then
+					Style.dir = -Style.dir
+					Style.untilT = t + rng:NextNumber(1.5, 3)
+				end
+				local away = unit(flat(pos - sk.hrp.Position))
+				local rot = (CFrame.Angles(0, math.rad(30 * Style.dir), 0) * CFrame.new(away)).Position
+				local p = sk.hrp.Position + unit(rot) * math.max(sk.d, 10)
+				steerMove(hrp, hum, Vector3.new(p.X, pos.Y, p.Z))
+			else
+				hum:MoveTo(pos)
+			end
+			return
+		end
+
 		local _, thrp = getCharacterParts(tg)
 		if not thrp then return end
 		local d = State.targetDist
 		local u = urgencyOf(State.myTime)
 		if Style.mode ~= "chase" or t > Style.untilT then pickChaseStyle() end
+
 		local p
 		if d < 6 or u > 0.75 then
-			-- وقت ضيق أو قريب: اندفاع مباشر
 			p = thrp.Position + flat(thrp.AssemblyLinearVelocity) * math.clamp(d / 16, 0, 0.5)
 		else
 			p = chasePoint(hrp, thrp, d, State.targetMem)
 		end
-		local dir = flat(p - hrp.Position)
-		if dir.Magnitude > 0.5 then
-			hum:MoveTo(hrp.Position + safeDirection(hrp, dir) * 10)
-		end
+		if (p - pos).Magnitude < 0.5 then hum:MoveTo(pos) else navMove(hrp, hum, p) end
+
+		if Style.name == "hopchase" and d > 6 then tryJump(hum, 0.9) end
+		local dy = thrp.Position.Y - pos.Y
+		if Config.Parkour and dy > 2 and dy < jumpHeightOf(hum) + 1 and d < 6 then forceJump(hum) end
 	else
 		local th = State.threat
 		if not th or State.threatDist > Config.FleeRange + 14 then
-			hum:MoveTo(hrp.Position)
+			hum:MoveTo(pos)
 			return
 		end
 		local _, thrp = getCharacterParts(th)
@@ -796,21 +1198,25 @@ local function aiStep()
 		local d = State.threatDist
 		local m = State.threatMem
 		local uh = urgencyOf(State.threatTime)
+		local last2 = State.threatTime ~= nil and State.threatTime <= 2.5
+		local ctx = { hrp = hrp, hum = hum, thrp = thrp }
 
-		if Style.mode ~= "flee" then pickFleeStyle(d, false, m) end
+		if Style.mode ~= "flee" then pickFleeStyle(ctx, d, false, m) end
 
 		local trig = 7
 		if Config.TimeAware then trig += 5 * uh end
+		if last2 then trig += 4 end
 		if Config.Memory and m and m.away < -0.3 then trig += 2 end
 
 		if d < trig and State.approaching and Style.name ~= "sidestep" and t - Style.lastSide > 0.6 then
-			pickFleeStyle(d, true, m)
+			pickFleeStyle(ctx, d, true, m)
 			tryJump(hum, 0.7)
 		elseif t > Style.untilT then
-			pickFleeStyle(d, false, m)
+			pickFleeStyle(ctx, d, false, m)
 		end
-		hum:MoveTo(fleePoint(hrp, thrp, d))
-		if d < 10 then tryJump(hum, 0.12 * Config.Aggro + 0.2 * uh) end
+
+		steerMove(hrp, hum, fleePoint(hrp, hum, thrp, d))
+		if d < 10 then tryJump(hum, 0.12 * Config.Aggro + 0.2 * uh + (last2 and 0.25 or 0)) end
 	end
 end
 
@@ -830,7 +1236,7 @@ local function reachStep()
 
 	local best, bestD
 	for _, plr in ipairs(Players:GetPlayers()) do
-		if not isTeammate(plr) and isInSameArena(plr) and not hasBomb(plr) then
+		if not isTeammate(plr) and isInSameArena(plr) and not hasBomb(plr) and not isImmune(plr) then
 			local _, thrp = getCharacterParts(plr)
 			local d = (thrp.Position - hrp.Position).Magnitude
 			if d <= range and (not bestD or d < bestD) then best, bestD = thrp, d end
@@ -919,7 +1325,7 @@ local titleGrad = gradient(title, Color3.fromRGB(60, 40, 140), Color3.fromRGB(20
 local titleLabel = label(title, "TIMEBOMB AI", 15, C.text, Enum.Font.GothamBlack)
 titleLabel.Position = UDim2.new(0, 12, 0, 3)
 titleLabel.Size = UDim2.new(1, -80, 0, 18)
-local titleSub = label(title, "v3  ·  LEGEND EDITION", 10, Color3.fromRGB(190, 200, 255), Enum.Font.GothamMedium)
+local titleSub = label(title, "v4  ·  LEGEND EDITION", 10, Color3.fromRGB(190, 200, 255), Enum.Font.GothamMedium)
 titleSub.Position = UDim2.new(0, 12, 0, 20)
 titleSub.Size = UDim2.new(1, -80, 0, 12)
 
@@ -1079,7 +1485,7 @@ for i, name in ipairs(tabNames) do
 	line.Visible = false
 	line.Parent = b
 	corner(line, 1)
-	b.MouseButton1Click:Connect(function() selectTab(i) end)
+	b.Activated:Connect(function() selectTab(i) end)
 	tabBtns[i], tabLines[i] = b, line
 end
 
@@ -1120,7 +1526,7 @@ local function makeToggle(page, name, sub, key, onChange)
 	end
 	apply(false)
 	Refreshers[key] = function() apply(true) end
-	track.MouseButton1Click:Connect(function()
+	track.Activated:Connect(function()
 		Config[key] = not Config[key]
 		if onChange then onChange(Config[key]) end
 		apply(true)
@@ -1195,7 +1601,7 @@ local function makeButton(page, text, cb)
 	b.TextSize = 12
 	b.TextColor3 = Color3.new(1, 1, 1)
 	b.Parent = row
-	b.MouseButton1Click:Connect(cb)
+	b.Activated:Connect(cb)
 end
 
 -- صفحة التحكم
@@ -1214,6 +1620,8 @@ makeToggle(pControl, "CAMERA TRACK", "الكاميرا تتبع الهدف", "Ca
 makeToggle(pControl, "TIME CALC", "حساب الوقت وتغيير الأسلوب", "TimeAware")
 makeToggle(pControl, "EDGE ANALYSIS", "تحليل الحافات والزوايا", "EdgeAI")
 makeToggle(pControl, "OPPONENT MEMORY", "يتعلم أسلوب كل خصم", "Memory")
+makeToggle(pControl, "SMART NAV", "يتجنب الجدران ويصعد بمسار", "Nav", function() navReset() end)
+makeToggle(pControl, "PARKOUR", "قفز وتسلق واختباء خلف الأعمدة", "Parkour")
 makeToggle(pControl, "AUTO RESTART", "يشتغل تلقائياً كل جولة", "AutoRestart")
 
 -- صفحة الضبط
@@ -1221,6 +1629,7 @@ makeSlider(pTuning, "Reach Range", "ReachDistance", 6, 25, function(x) return st
 makeSlider(pTuning, "Reaction Time", "Reaction", 0.05, 0.35, function(x) return string.format("%d ms", x * 1000) end)
 makeSlider(pTuning, "Dodge Aggression", "Aggro", 0, 1, function(x) return string.format("%d%%", x * 100) end)
 makeSlider(pTuning, "Urgent Time", "UrgentTime", 2, 8, function(x) return string.format("%.1f s", x) end)
+makeSlider(pTuning, "Tag-back Immunity", "Immunity", 0, 6, function(x) return string.format("%.1f s", x) end)
 makeButton(pTuning, "RE-SCAN ARENA  •  إعادة تحليل الساحة", function()
 	buildMap()
 	toast("Scanning arena...", C.accent2)
@@ -1349,12 +1758,69 @@ local function makeStat(name)
 end
 local stRounds, stPasses, stMap, stTracked, stSession = makeStat("Rounds"), makeStat("Passes"), makeStat("Arena cells"), makeStat("Opponents tracked"), makeStat("Session")
 
--- تصغير / إغلاق / سحب
+-- تصغير: الواجهة تتحول لكرة عائمة (اضغط عليها ترجع) | على الكمبيوتر: RightShift
+local orb = Instance.new("TextButton")
+orb.Size = UDim2.new(0, 46, 0, 46)
+orb.BackgroundColor3 = C.panel
+orb.Text = "AI"
+orb.Font = Enum.Font.GothamBlack
+orb.TextSize = 15
+orb.TextColor3 = C.text
+orb.AutoButtonColor = false
+orb.Visible = false
+orb.ZIndex = 50
+orb.Parent = gui
+corner(orb, 23)
+local orbStroke = Instance.new("UIStroke")
+orbStroke.Thickness = 2
+orbStroke.Color = Color3.new(1, 1, 1)
+orbStroke.Parent = orb
+local orbGrad = gradient(orbStroke, C.accent, C.accent2, 0)
+
 local minimized = false
-minBtn.MouseButton1Click:Connect(function()
-	minimized = not minimized
-	tween(main, 0.25, { Size = minimized and MINI_SIZE or FULL_SIZE })
-end)
+local function setMinimized(state)
+	minimized = state
+	if state then
+		orb.Position = main.Position
+		main.Visible = false
+		orb.Visible = true
+	else
+		main.Position = orb.Position
+		orb.Visible = false
+		main.Visible = true
+		main.Size = MINI_SIZE
+		tween(main, 0.3, { Size = FULL_SIZE })
+	end
+end
+minBtn.Activated:Connect(function() setMinimized(true) end)
+
+do
+	local dragging, moved, dragStart, startPos = false, false, nil, nil
+	orb.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved, dragStart, startPos = true, false, input.Position, orb.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					if not moved then setMinimized(false) end
+				end
+			end)
+		end
+	end)
+	table.insert(connections, UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			if d.Magnitude > 8 then moved = true end
+			if moved then
+				orb.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+			end
+		end
+	end))
+end
+table.insert(connections, UIS.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.KeyCode == Enum.KeyCode.RightShift then setMinimized(not minimized) end
+end))
 
 do
 	local dragging, dragStart, startPos
@@ -1383,7 +1849,7 @@ local function shutdown()
 	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
 	gui:Destroy()
 end
-closeBtn.MouseButton1Click:Connect(shutdown)
+closeBtn.Activated:Connect(shutdown)
 
 selectTab(1)
 tween(main, 0.45, { Size = FULL_SIZE })
@@ -1431,6 +1897,9 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 	-- إشعارات
 	local iHave = hasBomb(LP)
 	if iHave and not hadBomb then
+		local passer = State.lastThreat
+		if not passer or now() - State.lastThreatT > 1.5 then passer = nearestEnemy(25) end
+		if passer and Config.Immunity > 0 then Immune[passer.UserId] = now() + Config.Immunity end
 		toast("YOU HAVE THE BOMB  •  القنبلة معك!", C.bad)
 	elseif hadBomb and not iHave then
 		Stats.passes += 1
@@ -1474,6 +1943,7 @@ RunService:BindToRenderStep("TimebombAI", Enum.RenderPriority.Camera.Value + 1, 
 	if not alive then return end
 	local t = now()
 	strokeGrad.Rotation = (t * 60) % 360
+	orbGrad.Rotation = (t * 90) % 360
 	titleGrad.Offset = Vector2.new(math.sin(t) * 0.15, 0)
 	pcall(camTrack)
 	if Config.ShiftLock then pcall(updateShiftLock) end
