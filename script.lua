@@ -1,5 +1,5 @@
---// TIMEBOMB AI v5 · LEGEND EDITION
---// Time Calc | Edge Analysis | Opponent Memory | Smart Flee | Dodge Skills | Jump Dodges | Auto Climb | CamTrack | Radar UI
+--// TIMEBOMB AI v6 · LEGEND+ EDITION
+--// Time Calc | Edge Analysis | Opponent Memory | Smart Flee | Dodge Skills | Jump Dodges | Auto Climb + Ladders | Reflex System | ESP | Outfit Copy | Safe Zone | CamTrack | Radar UI
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
@@ -27,10 +27,18 @@ local Config = {
 	PassRange = 12,
 	FleeRange = 16.5,
 	ReachDistance = 14,
-	Reaction = 0.1,
+	Reaction = 0.05,
 	Aggro = 0.6,
 	UrgentTime = 4,
-	YTolerance = 18,
+	YTolerance = 60,      -- فرق الارتفاع المسموح بين اللاعبين في نفس الساحة (ساحات القفز طويلة)
+	MapYTolerance = 14,   -- ارتفاع خلايا الخريطة (تحليل الحافات)
+	Ladder = true,        -- تسلق السلالم (Truss)
+	Reflex = true,        -- ردة فعل خارقة: يراوغ لحظة وصول المطارد
+	ReflexWindow = 0.5,   -- كم ثانية قبل الاصطدام يبدأ الريفلكس
+	SafeZone = true,      -- يتمركز بمكان آمن بعيد عن الزوايا لما القنبلة بعيدة
+	ESP = true,           -- كشف اللاعبين اللي معك بنفس الساحة فقط
+	Outfit = false,       -- نسخ ملابس لاعب (يظهر عندك فقط)
+	OutfitUser = "FF_071",
 }
 
 local C = {
@@ -62,7 +70,8 @@ local State = {
 	peak = 0, lastHT = 0, lockedTarget = nil, dots = {}, lastThreat = nil, lastThreatT = 0, stalk = nil,
 }
 local Style = { mode = "", name = "", untilT = 0, phaseT = 0, dir = 1, period = 0.4, cache = nil, cacheT = 0, lastSide = 0, nextJump = 0 }
-local Stats = { rounds = 0, passes = 0, jumps = 0, climbs = 0, t0 = os.clock() }
+local Stats = { rounds = 0, passes = 0, jumps = 0, climbs = 0, reflex = 0, t0 = os.clock() }
+local LG = {} -- مساحة أسماء للميزات الجديدة (حد 200 متغير محلي بلوا)
 
 local function now() return os.clock() end
 local function flat(v) return Vector3.new(v.X, 0, v.Z) end
@@ -589,17 +598,145 @@ local function findLedge(hrp, hum, thrp, goal)
 	return best
 end
 
--- تسلق: الهدف فوقك → مسار، وإذا ما في مسار يقفز من حافة لحافة لين يوصله
+----------------------------------------------------------------
+-- السلالم (Truss): يلقى سلم يوصل لفوق، يمشي له، ويتسلقه
+----------------------------------------------------------------
+LG.Ladder = {
+	part = nil, bad = {}, list = {}, listT = -100, since = 0, lastStep = 0, commitUntil = 0,
+	lastY = 0, lastYT = 0, rot = 0, nearT = 0, dir0 = Vector3.new(0, 0, 1),
+}
+
+function LG.refreshTrusses()
+	local wait = (#LG.Ladder.list == 0) and 30 or 8
+	if now() - LG.Ladder.listT < wait then return end
+	LG.Ladder.listT = now()
+	local list = {}
+	for _, d in ipairs(Workspace:GetDescendants()) do
+		if d:IsA("TrussPart") then list[#list + 1] = d end
+	end
+	LG.Ladder.list = list
+end
+
+-- أفضل سلم: يبدأ من مستواك ويوصل لفوق وقريب من الهدف
+function LG.pickTruss(pos, feetY, goalY, maxD)
+	LG.refreshTrusses()
+	local t0 = now()
+	local best, bestScore
+	for _, tr in ipairs(LG.Ladder.list) do
+		if tr.Parent and (LG.Ladder.bad[tr] or 0) < t0 and tr.CFrame.UpVector.Y > 0.7 and not looksLikeLobby(tr) then
+			local top = tr.Position.Y + tr.Size.Y / 2
+			local bot = tr.Position.Y - tr.Size.Y / 2
+			local fd = flat(tr.Position - pos).Magnitude
+			if fd <= maxD and top > feetY + 4 and bot < feetY + 5 then
+				local score = -fd * 0.6 - math.abs(top - goalY) * 1.2
+				if not best or score > bestScore then best, bestScore = tr, score end
+			end
+		end
+	end
+	return best
+end
+
+function LG.trussStep(hrp, hum, goal)
+	local t = now()
+	local pos = hrp.Position
+	local feetY = pos.Y - (hum.HipHeight + hrp.Size.Y / 2)
+	local goalFlat = flat(goal - pos)
+	LG.Ladder.lastStep = t
+
+	-- أنا على السلم الحين: اطلع، وفوق ادفع للأمام عشان تنزل على المنصة
+	if hum:GetState() == Enum.HumanoidStateType.Climbing then
+		local p = LG.Ladder.part
+		if not p or not p.Parent then
+			p = LG.pickTruss(pos, feetY - 40, goal.Y, 8)
+			LG.Ladder.part = p
+		end
+		LG.Ladder.commitUntil = t + 2.5
+		local into = p and flat(p.Position - pos) or Vector3.zero
+		local inDir = into.Magnitude > 0.15 and into.Unit or unit(flat(hrp.CFrame.LookVector))
+		local top = p and (p.Position.Y + p.Size.Y / 2) or (feetY + 100)
+		if t - LG.Ladder.lastYT > 1.3 then
+			if p and pos.Y - LG.Ladder.lastY < 0.8 and feetY < top - 3 and goal.Y > feetY + 1 then
+				-- معلّق على السلم: انزل وجرب غيره
+				LG.Ladder.bad[p] = t + 10
+				LG.Ladder.part = nil
+				hum.Jump = true
+				return true
+			end
+			LG.Ladder.lastY, LG.Ladder.lastYT = pos.Y, t
+		end
+		if feetY >= top - 3 or feetY >= goal.Y - 2.5 then
+			local dir = inDir
+			if goalFlat.Magnitude > 1 then dir = unit(inDir + goalFlat.Unit * 0.6) end
+			hum:MoveTo(pos + dir * 8)
+		else
+			hum:MoveTo(pos + inDir * 6)
+		end
+		return true
+	end
+
+	-- مو على السلم: اختر سلم وامش له
+	LG.Ladder.lastY, LG.Ladder.lastYT = pos.Y, t
+	local p = LG.Ladder.part
+	if p and (not p.Parent or (LG.Ladder.bad[p] or 0) > t or p.Position.Y + p.Size.Y / 2 <= feetY + 3.5) then
+		p = nil
+		LG.Ladder.part = nil
+	end
+	if not p then
+		p = LG.pickTruss(pos, feetY, goal.Y, 140)
+		LG.Ladder.part = p
+		if p then
+			LG.Ladder.since, LG.Ladder.rot, LG.Ladder.nearT = t, 0, 0
+			local d0 = flat(p.Position - pos)
+			LG.Ladder.dir0 = d0.Magnitude > 0.1 and d0.Unit or Vector3.new(0, 0, 1)
+		end
+	end
+	if not p then return false end
+	if t - LG.Ladder.since > 16 then
+		LG.Ladder.bad[p] = t + 15
+		LG.Ladder.part = nil
+		return false
+	end
+	LG.Ladder.commitUntil = t + 3
+
+	local tp = p.Position
+	local half = math.max(p.Size.X, p.Size.Z) / 2
+	local bot = tp.Y - p.Size.Y / 2
+	local approach = Vector3.new(tp.X, pos.Y, tp.Z) - rotate(LG.Ladder.dir0, LG.Ladder.rot) * (half + 1.7)
+	if flat(approach - pos).Magnitude > 3 then
+		navMove(hrp, hum, approach)
+		LG.Ladder.nearT = 0
+	else
+		if LG.Ladder.nearT == 0 then LG.Ladder.nearT = t end
+		hum:MoveTo(Vector3.new(tp.X, pos.Y, tp.Z))
+		if bot > feetY + 1.2 then forceJump(hum) end
+		if t - LG.Ladder.nearT > 2.6 then
+			-- ما دخل السلم من هالجهة (جدار؟): جرب جهة ثانية
+			LG.Ladder.rot = (LG.Ladder.rot + 90) % 360
+			LG.Ladder.nearT = 0
+		end
+	end
+	return true
+end
+
+-- تسلق: الهدف فوقك → مسار / سلم / وإذا ما في يقفز من حافة لحافة لين يوصله
 local climbCache, climbT = nil, 0
 local function climbMove(hrp, hum, goal)
 	local pos = hrp.Position
 	local to = goal - pos
 	local fd = flat(to).Magnitude
 	local jh = jumpHeightOf(hum)
+	local t = now()
+	local cj = canJump(hum)
+
+	-- على سلم أو ماشي له: كمّل بدون ما تقاطعه المسارات
+	if Config.Ladder and (hum:GetState() == Enum.HumanoidStateType.Climbing or (LG.Ladder.part and LG.Ladder.commitUntil > t)) then
+		if LG.trussStep(hrp, hum, goal) then return true end
+	end
+
 	if stuckCheck(hrp, hum, to) then return true end
 
 	-- تحته أو جنبه وضمن مدى القفز: اقفز عليه
-	if fd < 6 and to.Y <= jh + 2.5 then
+	if cj and fd < 6 and to.Y <= jh + 2.5 then
 		hum:MoveTo(pos + unit(flat(to)) * 8)
 		if forceJump(hum) then Stats.climbs += 1 end
 		return true
@@ -611,7 +748,16 @@ local function climbMove(hrp, hum, goal)
 	end
 	if followPath(hrp, hum) then return true end
 
-	-- 2) حافة تقفز عليها وتقربك منه
+	-- 2) سلم (المسار فشل أو ما جهز)
+	if Config.Ladder then
+		if Nav.computing then
+			hum:MoveTo(pos)
+			return true
+		end
+		if LG.trussStep(hrp, hum, goal) then return true end
+	end
+
+	-- 3) حافة تقفز عليها وتقربك منه
 	if now() - climbT > 0.35 then
 		climbT = now()
 		climbCache = findLedge(hrp, hum, nil, goal)
@@ -694,7 +840,7 @@ local function buildMap()
 			for j = 0, last do
 				local p = Vector3.new(origin.X + i * step, c.Y + 3, origin.Z + j * step)
 				local res = Workspace:Raycast(p, Vector3.new(0, -60, 0), params)
-				local walk = res ~= nil and not looksLikeLobby(res.Instance) and math.abs(res.Position.Y - c.Y) < Config.YTolerance
+				local walk = res ~= nil and not looksLikeLobby(res.Instance) and math.abs(res.Position.Y - c.Y) < Config.MapYTolerance
 				cells[i][j] = { walk = walk, edge = 99, open = 0, corner = false }
 				if walk then walkCount += 1 end
 				rays += 1
@@ -1061,6 +1207,9 @@ local FLEE_DUR = {
 	-- قفز (فقط لو القفز ممكن)
 	bhop = { 1.0, 1.8 }, hop = { 1.2, 1.2 }, jumpjuke = { 0.9, 0.9 }, hopcircle = { 1.2, 2.0 },
 	leap = { 1.0, 1.6 }, jumpfeint = { 0.8, 0.8 }, zigjump = { 1.0, 1.8 }, doublehop = { 1.0, 1.0 },
+	-- أسطورية (v6)
+	phantom = { 0.9, 1.0 }, figure8 = { 1.4, 2.4 }, ghost = { 0.8, 1.4 }, sidewinder = { 1.2, 2.0 }, snapback = { 1.0, 1.6 },
+	airstrafe = { 1.2, 2.0 }, skydance = { 1.0, 1.1 }, ladder = { 3.5, 4.5 },
 }
 
 local function pickFleeStyle(ctx, d, forceSide, m)
@@ -1089,12 +1238,25 @@ local function pickFleeStyle(ctx, d, forceSide, m)
 		local function addJ(name, w) if jmp then add(name, w * jw) end end
 		local hasCenter = getCenter() ~= nil
 
+		-- هروب للسلالم: سلم قريب أبعد عن المطارد منّي
+		local trussPick
+		if Config.Ladder and d > 6 then
+			local fy = ctx.hrp.Position.Y - (ctx.hum.HipHeight + ctx.hrp.Size.Y / 2)
+			local tr = LG.pickTruss(ctx.hrp.Position, fy, fy + 25, 35)
+			if tr and flat(tr.Position - ctx.thrp.Position).Magnitude > flat(tr.Position - ctx.hrp.Position).Magnitude + 5 then
+				trussPick = tr
+			end
+		end
+		local function addL(w) if trussPick then add("ladder", w) end end
+
 		if last2 then
 			-- آخر ثواني: لا تخليه يمررها لك
 			add("kite", 3); add("juke", 2); add("sidestep", 1); add("dash", 1.5); add("cutback", 1.5)
 			if pillar then add("pillar", 2) end
 			if ledge then add("hop", 2 * jw) end
 			addJ("jumpjuke", 2); addJ("leap", 2)
+			add("phantom", 2); add("sidewinder", 2); add("snapback", 2)
+			addJ("skydance", 2); addJ("airstrafe", 1.5); addL(1.5)
 		elseif Config.TimeAware and uh > 0.7 then
 			add("kite", 2); add("zigzag", 1.2); add("circle", 1); add("juke", 1.5)
 			add("weave", 1); add("spiral", 1); add("dash", 1.2); add("stopgo", 0.8)
@@ -1102,11 +1264,14 @@ local function pickFleeStyle(ctx, d, forceSide, m)
 			if pillar then add("pillar", 2) end
 			if ledge then add("hop", 1.5 * jw) end
 			addJ("bhop", 1); addJ("jumpjuke", 1.5); addJ("zigjump", 1.2); addJ("doublehop", 1.2); addJ("leap", 1)
+			add("phantom", 1.5); add("sidewinder", 1.5); add("ghost", 1); add("snapback", 1.5)
+			addJ("skydance", 1.5); addJ("airstrafe", 1.2); addL(2)
 		elseif Config.TimeAware and uh < 0.3 and d > 12 then
 			add("smart", 3); add("kite", 2.5); add("circle", 1); add("weave", 1); add("snake", 1)
 			if hasCenter then add("loop", 1.5) end
 			if pillar then add("pillar", 1.5) end
 			addJ("hopcircle", 1); addJ("bhop", 0.8)
+			add("figure8", 1); add("sidewinder", 0.8); addL(1)
 		else
 			add("smart", 2); add("zigzag", 1.4); add("circle", 1.2); add("brake", 0.8); add("kite", 1)
 			add("juke", 0.8); add("weave", 1.2); add("snake", 1); add("spiral", 1); add("stopgo", 0.8)
@@ -1118,12 +1283,16 @@ local function pickFleeStyle(ctx, d, forceSide, m)
 			addJ("bhop", 0.8); addJ("jumpjuke", 1); addJ("hopcircle", 1); addJ("zigjump", 1)
 			addJ("leap", 1); addJ("doublehop", 1)
 			if d > 9 then addJ("jumpfeint", 1) end
+			add("phantom", 1.2); add("figure8", 1); add("ghost", 0.8); add("sidewinder", 1.2); add("snapback", 1)
+			addJ("airstrafe", 1); addJ("skydance", 1); addL(1.2)
 		end
 		if Config.Memory and m and m.erratic > 0.3 then add("smart", 2) end
 
 		Style.name = pickWeighted(list)
 		if Style.name == "sidestep" then Style.lastSide = t end
-		if Style.name == "pillar" then Style.data = pillar elseif Style.name == "hop" then Style.data = ledge end
+		if Style.name == "pillar" then Style.data = pillar
+		elseif Style.name == "hop" then Style.data = ledge
+		elseif Style.name == "ladder" then Style.data = trussPick end
 		local dr = FLEE_DUR[Style.name] or { 0.6, 1.2 }
 		dur = rng:NextNumber(dr[1], dr[2])
 		if last2 then dur *= 0.6 end
@@ -1276,6 +1445,66 @@ local function fleePoint(hrp, hum, thrp, d)
 		else
 			p = pos + unit(perp(away) * -Style.dir + away * 0.9) * 14
 		end
+	-------------------- أسطورية (v6) --------------------
+	elseif n == "phantom" then
+		-- التزام وهمي بجهة ← وقفة ميتة ← انفجار للجهة المعاكسة
+		if el < 0.22 then
+			p = pos + unit(perp(away) * Style.dir + away * 0.5) * 10
+		elseif el < 0.34 then
+			return pos
+		else
+			p = pos + unit(perp(away) * -Style.dir + away * 0.8) * 15
+		end
+	elseif n == "figure8" then
+		-- رقم 8: يبدل جهة الدوران كل نص ثانية وهو يبتعد
+		local s = (math.floor(el / 0.55) % 2 == 0) and 1 or -1
+		p = pos + unit(perp(away) * s * Style.dir + away * 0.55) * 12
+	elseif n == "ghost" then
+		-- ارتعاش جانبي سريع جداً يصعّب التوقع
+		local s = math.sin(el * 13) >= 0 and 1 or -1
+		p = pos + unit(away + perp(away) * s * 0.85) * 12
+	elseif n == "sidewinder" then
+		-- دايماً عمودي على اتجاه جري المطارد، ويعكس كل ~1 ثانية
+		local tv = flat(thrp.AssemblyLinearVelocity)
+		local ref = tv.Magnitude > 3 and tv.Unit or -away
+		local s = (math.floor(el / 0.9) % 2 == 0) and 1 or -1
+		local sd = perp(ref) * s * Style.dir
+		if sd:Dot(away) < -0.2 then sd = -sd end
+		p = pos + unit(sd + away * 0.4) * 12
+	elseif n == "snapback" then
+		-- يجري مستقيم ولما يقرب المطارد ينكسر 100 درجة فجأة (حسب المسافة مو الوقت)
+		if d > 10 then
+			p = pos + away * 12
+		else
+			local tv = flat(thrp.AssemblyLinearVelocity)
+			local side = Style.dir
+			if tv.Magnitude > 3 then side = (tv:Dot(perp(away)) > 0) and -1 or 1 end
+			p = pos + unit(rotate(away, 100 * side)) * 14
+		end
+	elseif n == "airstrafe" then
+		-- كل قفزة باتجاه جانبي معاكس للي قبلها
+		local s = (math.floor(el / 0.46) % 2 == 0) and 1 or -1
+		p = pos + unit(away + perp(away) * s * Style.dir) * 13
+		pulseJump(hum, 0.46)
+	elseif n == "skydance" then
+		-- فانتوم + قفزات في الهواء
+		if el < 0.22 then
+			p = pos + unit(perp(away) * Style.dir + away * 0.5) * 10
+			pulseJump(hum, 0.3)
+		elseif el < 0.34 then
+			return pos
+		else
+			p = pos + unit(perp(away) * -Style.dir + away * 0.8) * 15
+			pulseJump(hum, 0.3)
+		end
+	elseif n == "ladder" then
+		local tr = Style.data
+		if tr and tr.Parent and Config.Ladder then
+			local top = tr.Position.Y + tr.Size.Y / 2
+			LG.Ladder.part = tr
+			if LG.trussStep(hrp, hum, Vector3.new(tr.Position.X, top + 3, tr.Position.Z)) then return nil end
+		end
+		return bestEscapePoint(hrp, thrp)
 	else
 		return bestEscapePoint(hrp, thrp)
 	end
@@ -1297,23 +1526,25 @@ local function pickChaseStyle(hum)
 	local jw = Config.JumpRate * 2
 	local list
 	if Config.EdgeAI and State.targetEdge and State.targetEdge <= 16 then
-		list = { { "pin", 3 }, { "direct", 1 }, { "cutoff", 1 }, { "stutter", 0.6 }, { "weave", 0.6 } }
+		list = { { "pin", 3 }, { "direct", 1 }, { "cutoff", 1 }, { "stutter", 0.6 }, { "weave", 0.6 }, { "intercept", 1.2 } }
 	elseif u < 0.3 then
 		list = {
 			{ "flank", 2 }, { "feint", 2 }, { "cutoff", 1.5 }, { "arc", 1.5 }, { "bait", 1.2 },
-			{ "stutter", 1.2 }, { "mirror", 1.5 }, { "direct", 1 }, { "weave", 1.4 }, { "ambush", 1.2 },
+			{ "stutter", 1.2 }, { "mirror", 1.5 }, { "direct", 1 }, { "weave", 1.4 }, { "ambush", 1.2 }, { "intercept", 2 },
 		}
 		if jmp then
 			list[#list + 1] = { "hopchase", 0.8 * jw }
 			list[#list + 1] = { "hopflank", 1 * jw }
 			list[#list + 1] = { "hopweave", 1 * jw }
+			list[#list + 1] = { "fakecut", 1 * jw }
 			list[#list + 1] = { "leapin", 1 * jw }
 		end
 	else
-		list = { { "direct", 3 }, { "cutoff", 2 }, { "flank", 1.2 }, { "arc", 1.2 }, { "feint", 1 }, { "mirror", 0.8 }, { "weave", 1 } }
+		list = { { "direct", 3 }, { "cutoff", 2 }, { "flank", 1.2 }, { "arc", 1.2 }, { "feint", 1 }, { "mirror", 0.8 }, { "weave", 1 }, { "intercept", 2.5 } }
 		if jmp then
 			list[#list + 1] = { "hopchase", 0.8 * jw }
 			list[#list + 1] = { "hopflank", 0.8 * jw }
+			list[#list + 1] = { "fakecut", 0.8 * jw }
 			list[#list + 1] = { "leapin", 1 * jw }
 		end
 	end
@@ -1395,8 +1626,164 @@ local function chasePoint(hrp, hum, thrp, d, m)
 		end
 	elseif n == "leapin" then
 		if d < 10 and d > 4 then pulseJump(hum, 0.55) end
+	elseif n == "intercept" then
+		-- حل رياضي لنقطة التقاطع: وين نلتقيه لو جرينا بأقصى سرعة
+		local sp = math.max(hum.WalkSpeed, 8)
+		local rel = flat(tpos - pos)
+		local a = tvel:Dot(tvel) - sp * sp
+		local b = 2 * rel:Dot(tvel)
+		local c = rel:Dot(rel)
+		local tt
+		if math.abs(a) < 1e-3 then
+			if b < -1e-3 then tt = -c / b end
+		else
+			local disc = b * b - 4 * a * c
+			if disc >= 0 then
+				local sq = math.sqrt(disc)
+				local t1, t2 = (-b - sq) / (2 * a), (-b + sq) / (2 * a)
+				if t1 > 0 and t2 > 0 then tt = math.min(t1, t2) else tt = math.max(t1, t2) end
+			end
+		end
+		if tt and tt > 0 then
+			tt = math.clamp(tt, 0, 1.3)
+			return tpos + tvel * tt
+		end
+	elseif n == "fakecut" then
+		-- فيك جانبي مع قفزة ثم ينقض
+		if d > 7 and el < 0.3 then
+			pulseJump(hum, 0.3)
+			return pos + unit(perp(toT) * Style.dir) * 8
+		end
 	end
 	return predicted
+end
+
+--------------------------------------------------------------------
+-- Reflex: ردة فعل خارقة (يشتغل كل فريم مو كل فترة)
+--------------------------------------------------------------------
+LG.Reflex = { untilT = 0, brakeUntil = 0, vec = Vector3.new(0, 0, 1), cd = 0, jump = false, jumped = false }
+
+function LG.reflexTrigger(hrp, hum, thrp, m, dist)
+	local t = now()
+	local pos = hrp.Position
+	local toMe = unit(flat(pos - thrp.Position))
+	local tv = flat(thrp.AssemblyLinearVelocity)
+	local ref = tv.Magnitude > 4 and tv.Unit or toMe
+	local s1 = perp(ref)
+	local lean = (Config.Memory and m and m.time > 3) and math.clamp(m.bias, -1, 1) or 0
+	local cands = {
+		{ s1, "snap" }, { -s1, "snap" },
+		{ unit(s1 + toMe * 0.9), "slip" }, { unit(-s1 + toMe * 0.9), "slip" },
+	}
+	local best, bestScore
+	for _, c in ipairs(cands) do
+		local dir = c[1]
+		local p = pos + dir * 9
+		local score = rng:NextNumber(0, 1.5) + dir:Dot(toMe) * 1.5 - dir:Dot(perp(toMe)) * lean * 3
+		if not hasFloorAt(p) then score -= 100 end
+		local cell = Config.EdgeAI and cellAt(p) or nil
+		if cell then
+			if not cell.walk then score -= 100 end
+			score += math.min(cell.edge, 24) * 0.12
+			if cell.corner then score -= 4 end
+		end
+		if Config.Nav and not clearLine(pos, p) then score -= 60 end
+		if not best or score > bestScore then best, bestScore = c, score end
+	end
+	LG.Reflex.vec = best[1]
+	local dur = best[2] == "slip" and 0.34 or 0.26
+	LG.Reflex.brakeUntil = 0
+	if rng:NextNumber() < 0.22 and dist > 5 then
+		-- فيك بريك: وقفة جزء من الثانية ثم انفجار
+		LG.Reflex.brakeUntil = t + 0.07
+		dur += 0.07
+	end
+	LG.Reflex.untilT = t + dur
+	LG.Reflex.cd = t + dur + rng:NextNumber(0.12, 0.3)
+	LG.Reflex.jump = Config.JumpDodge and canJump(hum) and rng:NextNumber() < math.clamp(Config.JumpRate * 0.9 + 0.15, 0, 1)
+	LG.Reflex.jumped = false
+	Style.name, Style.mode, Style.cache = "REFLEX " .. best[2], "flee", nil
+	Style.untilT = LG.Reflex.untilT
+	Stats.reflex += 1
+end
+
+function LG.reflexStep()
+	if not (Config.Reflex and Config.AI) then return end
+	local t = now()
+	local _, hrp, hum = getCharacterParts(LP)
+	if not hrp or hasBomb(LP) then
+		LG.Reflex.untilT = 0
+		return
+	end
+	if LG.Reflex.untilT > t then
+		if t < LG.Reflex.brakeUntil then
+			hum:MoveTo(hrp.Position)
+		else
+			hum:MoveTo(hrp.Position + LG.Reflex.vec * 10)
+			if LG.Reflex.jump and not LG.Reflex.jumped then
+				LG.Reflex.jumped = true
+				forceJump(hum)
+			end
+		end
+		return
+	end
+	local th = State.threat
+	if not th or t < LG.Reflex.cd then return end
+	local _, thrp = getCharacterParts(th)
+	if not thrp then return end
+	local rel = flat(hrp.Position - thrp.Position)
+	local dist = rel.Magnitude
+	if dist > 14 or dist < 0.1 then return end
+	local toMe = rel / dist
+	local tv = flat(thrp.AssemblyLinearVelocity)
+	local mv = flat(hrp.AssemblyLinearVelocity)
+	local closing = (tv - mv):Dot(toMe)
+	local tti = closing > 5 and (dist - 3.4) / closing or math.huge
+	local pursuing = tv.Magnitude > 6 and tv.Unit:Dot(toMe) > 0.55
+	if (tti < Config.ReflexWindow and dist < 12) or (pursuing and dist < 6.5) then
+		LG.reflexTrigger(hrp, hum, thrp, State.threatMem, dist)
+	end
+end
+
+--------------------------------------------------------------------
+-- Safe Zone: لما القنبلة بعيدة تروح لمكان مفتوح بعيد عن الزوايا والحافات
+--------------------------------------------------------------------
+LG.Idle = { point = nil, t = 0 }
+function LG.safeZone(hrp, hum, th)
+	local pos = hrp.Position
+	local t = now()
+	if t - LG.Idle.t > 1.2 then
+		LG.Idle.t = t
+		local thp
+		if th then
+			local _, h = getCharacterParts(th)
+			thp = h and h.Position
+		end
+		local ci = math.floor((pos.X - Map.origin.X) / Map.step + 0.5)
+		local cj = math.floor((pos.Z - Map.origin.Z) / Map.step + 0.5)
+		local best, bs
+		for i = ci - 4, ci + 4 do
+			local row = Map.cells[i]
+			if row then
+				for j = cj - 4, cj + 4 do
+					local c = row[j]
+					if c and c.walk and not c.corner then
+						local p = Vector3.new(Map.origin.X + i * Map.step, pos.Y, Map.origin.Z + j * Map.step)
+						local s = math.min(c.edge, 24) * 1.2 + c.open * 8 - flat(p - pos).Magnitude * 0.35
+						if thp then s += math.min(flat(p - thp).Magnitude, 50) * 0.5 end
+						if not best or s > bs then best, bs = p, s end
+					end
+				end
+			end
+		end
+		LG.Idle.point = best
+	end
+	local p = LG.Idle.point
+	if p and flat(p - pos).Magnitude > 3 then
+		steerMove(hrp, hum, p)
+	else
+		hum:MoveTo(pos)
+	end
 end
 
 local function resetAI()
@@ -1405,6 +1792,9 @@ local function resetAI()
 	Jump.fails, Jump.blockedUntil = 0, 0 -- كل جولة/ساحة نختبر القفز من جديد
 	climbCache = nil
 	navReset()
+	LG.Ladder.part, LG.Ladder.bad, LG.Ladder.list, LG.Ladder.listT, LG.Ladder.commitUntil = nil, {}, {}, -100, 0
+	LG.Reflex.untilT, LG.Reflex.cd = 0, 0
+	LG.Idle.point, LG.Idle.t = nil, 0
 end
 
 local function aiStep()
@@ -1412,6 +1802,11 @@ local function aiStep()
 	if not hrp then return end
 	local t = now()
 	local pos = hrp.Position
+
+	-- معلّق على سلم بدون سبب (مرّ عليه بالغلط): انزل منه
+	if Config.Ladder and t - LG.Ladder.lastStep > 0.8 and hum:GetState() == Enum.HumanoidStateType.Climbing then
+		hum.Jump = true
+	end
 
 	if hasBomb(LP) then
 		local tg = State.target
@@ -1452,8 +1847,8 @@ local function aiStep()
 
 		-- الخصم واقف فوق (منصة/مرتفع) وأنا أقدر أقفز: اطلع له
 		local dyT = thrp.Position.Y - pos.Y
-		local standing = thum ~= nil and thum.FloorMaterial ~= Enum.Material.Air
-		local climbing = Config.Climb and dyT > 2.5 and standing and canJump(hum)
+		local standing = thum ~= nil and (thum.FloorMaterial ~= Enum.Material.Air or thum:GetState() == Enum.HumanoidStateType.Climbing)
+		local climbing = Config.Climb and dyT > 2.5 and standing
 
 		if climbing and climbMove(hrp, hum, thrp.Position) then
 			-- تسلق (مسار أو قفز من حافة لحافة)
@@ -1465,9 +1860,10 @@ local function aiStep()
 
 		if Config.Parkour and dyT > 2 and dyT < jumpHeightOf(hum) + 1 and d < 6 then forceJump(hum) end
 	else
+		if LG.Reflex.untilT > t then return end -- الريفلكس يتحكم بالحركة
 		local th = State.threat
 		if not th or State.threatDist > Config.FleeRange + 14 then
-			hum:MoveTo(pos)
+			if Config.SafeZone and Map.ready then LG.safeZone(hrp, hum, th) else hum:MoveTo(pos) end
 			return
 		end
 		local _, thrp = getCharacterParts(th)
@@ -1492,7 +1888,8 @@ local function aiStep()
 			pickFleeStyle(ctx, d, false, m)
 		end
 
-		steerMove(hrp, hum, fleePoint(hrp, hum, thrp, d))
+		local fp = fleePoint(hrp, hum, thrp, d)
+		if fp then steerMove(hrp, hum, fp) end
 		if Config.JumpDodge and d < 10 then
 			tryJump(hum, 0.12 * Config.Aggro + 0.2 * uh + (last2 and 0.25 or 0))
 		end
@@ -1504,7 +1901,7 @@ end
 --------------------------------------------------------------------
 local lastReach = 0
 local function reachStep()
-	if now() - lastReach < 0.25 then return end
+	if now() - lastReach < 0.1 then return end
 	local _, hrp = getCharacterParts(LP)
 	if not hrp then return end
 	local bomb = findBombObject(LP)
@@ -1522,7 +1919,7 @@ local function reachStep()
 		end
 	end
 	if not best then return end
-	lastReach = now() + rng:NextNumber(0, 0.12)
+	lastReach = now() + rng:NextNumber(0, 0.04)
 
 	if bomb:IsA("Tool") then pcall(function() bomb:Activate() end) end
 	if firetouchinterest then
@@ -1621,7 +2018,7 @@ local titleGrad = gradient(title, Color3.fromRGB(70, 45, 160), Color3.fromRGB(20
 local titleLabel = label(title, "TIMEBOMB AI", 14, C.text, Enum.Font.GothamBlack)
 titleLabel.Position = UDim2.new(0, 12, 0, 3)
 titleLabel.Size = UDim2.new(1, -130, 0, 16)
-local titleSub = label(title, "v5  ·  LEGEND EDITION", 9, Color3.fromRGB(190, 200, 255), Enum.Font.GothamMedium)
+local titleSub = label(title, "v6  ·  LEGEND+ EDITION", 9, Color3.fromRGB(190, 200, 255), Enum.Font.GothamMedium)
 titleSub.Position = UDim2.new(0, 12, 0, 19)
 titleSub.Size = UDim2.new(1, -130, 0, 12)
 
@@ -1950,6 +2347,289 @@ local function makeButton(page, text, cb)
 	b.Activated:Connect(cb)
 end
 
+--------------------------------------------------------------------
+-- ESP: يكشف اللاعبين اللي معك بنفس الساحة فقط (يبين عندك انت)
+--------------------------------------------------------------------
+for _, old in ipairs(gui.Parent:GetChildren()) do
+	if old.Name == "MatchPanelESP" then old:Destroy() end
+end
+LG.ESP = { items = {}, folder = nil, t = 0 }
+
+function LG.espFolder()
+	if LG.ESP.folder and LG.ESP.folder.Parent then return LG.ESP.folder end
+	local f = Instance.new("Folder")
+	f.Name = "MatchPanelESP"
+	f.Parent = gui.Parent
+	LG.ESP.folder = f
+	return f
+end
+
+function LG.espDestroy(plr)
+	local it = LG.ESP.items[plr]
+	if it then
+		pcall(function() it.hl:Destroy() end)
+		pcall(function() it.bb:Destroy() end)
+		LG.ESP.items[plr] = nil
+	end
+end
+
+function LG.espClear()
+	for plr in pairs(LG.ESP.items) do LG.espDestroy(plr) end
+end
+
+function LG.espCreate(char, hrp)
+	local folder = LG.espFolder()
+	local hl = Instance.new("Highlight")
+	hl.Name = "ESPHL"
+	hl.Adornee = char
+	hl.FillTransparency = 0.7
+	hl.OutlineTransparency = 0
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Parent = folder
+
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "ESPBB"
+	bb.Adornee = char:FindFirstChild("Head") or hrp
+	bb.AlwaysOnTop = true
+	bb.Size = UDim2.new(0, 150, 0, 34)
+	bb.StudsOffsetWorldSpace = Vector3.new(0, 2.8, 0)
+	bb.Parent = folder
+
+	local tl = Instance.new("TextLabel")
+	tl.Size = UDim2.new(1, 0, 1, 0)
+	tl.BackgroundTransparency = 1
+	tl.Font = Enum.Font.GothamBold
+	tl.TextSize = 12
+	tl.TextStrokeTransparency = 0.3
+	tl.TextColor3 = Color3.new(1, 1, 1)
+	tl.Text = ""
+	tl.Parent = bb
+	return { char = char, hl = hl, bb = bb, tl = tl }
+end
+
+function LG.espStep()
+	local t = now()
+	if t - LG.ESP.t < 0.12 then return end
+	LG.ESP.t = t
+	if not Config.ESP then LG.espClear() return end
+	local _, myHrp = getCharacterParts(LP)
+	if not myHrp then LG.espClear() return end
+
+	local seen = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LP and isInSameArena(plr) then -- بس اللي معك بنفس الساحة
+			local char, hrp = getCharacterParts(plr)
+			if char then
+				seen[plr] = true
+				local it = LG.ESP.items[plr]
+				if it and (it.char ~= char or not it.hl.Parent) then
+					LG.espDestroy(plr)
+					it = nil
+				end
+				if not it then
+					it = LG.espCreate(char, hrp)
+					LG.ESP.items[plr] = it
+				end
+				local holder = hasBomb(plr)
+				local col = (holder and C.bad) or (plr == State.target and C.good) or C.accent2
+				it.hl.FillColor, it.hl.OutlineColor = col, col
+				it.tl.TextColor3 = col
+				local dist = (hrp.Position - myHrp.Position).Magnitude
+				local txt = string.format("%s\n%d m", plr.Name, dist)
+				if holder then
+					local tl = (plr == State.threat) and State.threatTime or nil
+					txt = string.format("[BOMB%s] %s\n%d m", tl and string.format(" %.1fs", tl) or "", plr.Name, dist)
+				end
+				it.tl.Text = txt
+			end
+		end
+	end
+	for plr in pairs(LG.ESP.items) do
+		if not seen[plr] then LG.espDestroy(plr) end
+	end
+end
+
+--------------------------------------------------------------------
+-- Outfit Copy: ينسخ ملابس لاعب ويطبقها عندك محلياً (ما أحد غيرك يشوفها)
+--------------------------------------------------------------------
+LG.Outfit = { items = nil, face = nil, backup = nil, busy = false, lastCheck = 0 }
+LG.OUTFIT_CLASSES = { Shirt = true, Pants = true, ShirtGraphic = true, BodyColors = true, CharacterMesh = true }
+
+function LG.isOutfitItem(c)
+	return LG.OUTFIT_CLASSES[c.ClassName] == true or c:IsA("Accessory")
+end
+
+function LG.safeClone(inst)
+	local ok, cl = pcall(function() return inst:Clone() end)
+	return ok and cl or nil
+end
+
+-- ننسخ ملابسي الأصلية مرة وحدة عشان نقدر نرجعها، ثم نشيل اللي بيتبدل
+function LG.outfitStrip(char, provided)
+	if not LG.Outfit.backup then
+		local b = Instance.new("Folder")
+		for _, c in ipairs(char:GetChildren()) do
+			if LG.isOutfitItem(c) and not c:GetAttribute("TB_Outfit") then
+				local cl = LG.safeClone(c)
+				if cl then cl.Parent = b end
+			end
+		end
+		local head = char:FindFirstChild("Head")
+		local face = head and head:FindFirstChild("face")
+		local fcl = face and LG.safeClone(face)
+		if fcl then
+			fcl.Name = "__face"
+			fcl.Parent = b
+		end
+		LG.Outfit.backup = b
+	end
+	for _, c in ipairs(char:GetChildren()) do
+		if LG.isOutfitItem(c) and (c:IsA("Accessory") or provided[c.ClassName] or c:GetAttribute("TB_Outfit")) then
+			c:Destroy()
+		end
+	end
+end
+
+function LG.putOutfit(char, hum)
+	if not LG.Outfit.items then return end
+	local provided = {}
+	for _, it in ipairs(LG.Outfit.items) do provided[it.ClassName] = true end
+	LG.outfitStrip(char, provided)
+	for _, it in ipairs(LG.Outfit.items) do
+		local c = LG.safeClone(it)
+		if c then
+			c:SetAttribute("TB_Outfit", true)
+			if c:IsA("Accessory") then
+				local h = c:FindFirstChild("Handle")
+				if h and h:IsA("BasePart") then
+					for _, w in ipairs(h:GetChildren()) do
+						if w:IsA("Weld") or w:IsA("WeldConstraint") then w:Destroy() end
+					end
+					h.CanCollide, h.CanTouch, h.CanQuery, h.Massless = false, false, false, true
+				end
+				local ok = pcall(function() hum:AddAccessory(c) end)
+				if not ok then c.Parent = char end
+			else
+				c.Parent = char
+			end
+		end
+	end
+	if LG.Outfit.face then
+		local head = char:FindFirstChild("Head")
+		if head then
+			for _, d in ipairs(head:GetChildren()) do
+				if d:IsA("Decal") and d.Name == "face" then d:Destroy() end
+			end
+			local f = LG.safeClone(LG.Outfit.face)
+			if f then
+				f.Name = "face"
+				f:SetAttribute("TB_Outfit", true)
+				f.Parent = head
+			end
+		end
+	end
+end
+
+function LG.findServerPlayer(name)
+	name = string.lower(name)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LP and (string.lower(p.Name) == name or string.lower(p.DisplayName) == name) then return p end
+	end
+	return nil
+end
+
+-- لقطة من ملابس اللاعب: من الشخصية الحية بالسيرفر، وإلا من حسابه
+function LG.snapshotOutfit(name)
+	local items, face = {}, nil
+	local function take(container, head)
+		for _, c in ipairs(container:GetChildren()) do
+			if LG.isOutfitItem(c) then
+				local cl = LG.safeClone(c)
+				if cl then items[#items + 1] = cl end
+			end
+		end
+		if head then
+			local d = head:FindFirstChild("face") or head:FindFirstChildOfClass("Decal")
+			if d then face = LG.safeClone(d) end
+		end
+	end
+	local plr = LG.findServerPlayer(name)
+	if plr and plr.Character then
+		take(plr.Character, plr.Character:FindFirstChild("Head"))
+		return items, face, plr.Name
+	end
+	local uid = tonumber(name) or Players:GetUserIdFromNameAsync(name)
+	local model = Players:GetCharacterAppearanceAsync(uid)
+	take(model, model:FindFirstChild("Head"))
+	model:Destroy()
+	return items, face, name
+end
+
+function LG.applyOutfit(name)
+	if LG.Outfit.busy then return end
+	LG.Outfit.busy = true
+	task.spawn(function()
+		local ok = pcall(function()
+			local items, face, who = LG.snapshotOutfit(name)
+			if #items == 0 and not face then error("empty") end
+			LG.Outfit.items, LG.Outfit.face = items, face
+			local char, _, hum = getCharacterParts(LP)
+			if char then LG.putOutfit(char, hum) end
+			toast("OUTFIT COPIED  •  " .. who, C.good)
+		end)
+		if not ok then
+			toast("OUTFIT FAILED  •  ما لقيت اللاعب", C.bad)
+			if not LG.Outfit.items then
+				Config.Outfit = false
+				if Refreshers.Outfit then Refreshers.Outfit() end
+			end
+		end
+		LG.Outfit.busy = false
+	end)
+end
+
+-- اللعبة ممكن تمسح الملابس كل جولة/ريسباون: نرجعها تلقائياً
+function LG.ensureOutfit()
+	if not (Config.Outfit and LG.Outfit.items) then return end
+	local char, _, hum = getCharacterParts(LP)
+	if not char then return end
+	for _, c in ipairs(char:GetChildren()) do
+		if c:GetAttribute("TB_Outfit") then return end
+	end
+	LG.putOutfit(char, hum)
+end
+
+function LG.restoreOutfit()
+	local char = LP.Character
+	if char then
+		for _, c in ipairs(char:GetDescendants()) do
+			if c:GetAttribute("TB_Outfit") then c:Destroy() end
+		end
+		if LG.Outfit.backup then
+			local head = char:FindFirstChild("Head")
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			for _, c in ipairs(LG.Outfit.backup:GetChildren()) do
+				local cl = LG.safeClone(c)
+				if cl then
+					if cl.Name == "__face" then
+						cl.Name = "face"
+						if head then cl.Parent = head end
+					elseif cl:IsA("Accessory") and hum then
+						pcall(function() hum:AddAccessory(cl) end)
+					else
+						cl.Parent = char
+					end
+				end
+			end
+		end
+	end
+	LG.Outfit.items, LG.Outfit.face = nil, nil
+	if LG.Outfit.backup then
+		LG.Outfit.backup:Destroy()
+		LG.Outfit.backup = nil
+	end
+end
+
 -- صفحة التحكم
 makeSection(pControl, "CORE")
 makeToggle(pControl, "AI AUTO-PLAY", "لعب تلقائي كامل", "AI", function(on)
@@ -1975,13 +2655,50 @@ makeToggle(pControl, "SMART NAV", "يتجنب الجدران ويصعد بمسا
 makeToggle(pControl, "PARKOUR", "قفز فوق الحواجز واختباء خلف الأعمدة", "Parkour")
 makeToggle(pControl, "AUTO CLIMB", "يطلع فوق لو الخصم فوق", "Climb")
 makeToggle(pControl, "JUMP DODGES", "مراوغات القفز (إذا الساحة تسمح)", "JumpDodge")
+makeSection(pControl, "LEGEND  •  v6")
+makeToggle(pControl, "ESP", "يكشف اللي معك بالساحة فقط", "ESP", function(on)
+	if not on then LG.espClear() end
+end)
+makeToggle(pControl, "REFLEX", "ردة فعل خارقة لحظة وصول المطارد", "Reflex")
+makeToggle(pControl, "LADDERS", "يتسلق السلالم لفوق", "Ladder", function()
+	LG.Ladder.part, LG.Ladder.bad, LG.Ladder.commitUntil = nil, {}, 0
+end)
+makeToggle(pControl, "SAFE ZONE", "يتمركز بمكان آمن لما القنبلة بعيدة", "SafeZone")
+makeSection(pControl, "OUTFIT")
+makeToggle(pControl, "COPY OUTFIT", "ينسخ ملابسه ويبين عندك انت بس", "Outfit", function(on)
+	if on then LG.applyOutfit(Config.OutfitUser) else LG.restoreOutfit() end
+end)
+LG.outCard = newCard(pControl, 40)
+LG.outBox = Instance.new("TextBox")
+LG.outBox.Size = UDim2.new(1, -20, 0, 26)
+LG.outBox.Position = UDim2.new(0, 10, 0.5, -13)
+LG.outBox.BackgroundColor3 = C.bg
+LG.outBox.BorderSizePixel = 0
+LG.outBox.Text = Config.OutfitUser
+LG.outBox.PlaceholderText = "Roblox username"
+LG.outBox.TextColor3 = C.text
+LG.outBox.PlaceholderColor3 = C.sub
+LG.outBox.Font = Enum.Font.GothamMedium
+LG.outBox.TextSize = 12
+LG.outBox.ClearTextOnFocus = false
+LG.outBox.Parent = LG.outCard
+corner(LG.outBox, 7)
+LG.outBox.FocusLost:Connect(function()
+	local nm = (string.gsub(LG.outBox.Text, "%s+", ""))
+	if nm ~= "" and nm ~= Config.OutfitUser then
+		Config.OutfitUser = nm
+		if Config.Outfit then LG.applyOutfit(nm) end
+	end
+	LG.outBox.Text = Config.OutfitUser
+end)
 
 -- صفحة الضبط
 makeSection(pTuning, "TUNING")
 makeSlider(pTuning, "Reach Range", "ReachDistance", 6, 25, function(x) return string.format("%.0f", x) end)
-makeSlider(pTuning, "Reaction Time", "Reaction", 0.05, 0.35, function(x) return string.format("%d ms", x * 1000) end)
+makeSlider(pTuning, "Reaction Time", "Reaction", 0.02, 0.35, function(x) return string.format("%d ms", x * 1000) end)
 makeSlider(pTuning, "Dodge Aggression", "Aggro", 0, 1, function(x) return string.format("%d%%", x * 100) end)
 makeSlider(pTuning, "Jump Dodge Rate", "JumpRate", 0, 1, function(x) return string.format("%d%%", x * 100) end)
+makeSlider(pTuning, "Reflex Window", "ReflexWindow", 0.25, 0.8, function(x) return string.format("%d ms", x * 1000) end)
 makeSlider(pTuning, "Urgent Time", "UrgentTime", 2, 8, function(x) return string.format("%.1f s", x) end)
 makeSlider(pTuning, "Tag-back Immunity", "Immunity", 0, 6, function(x) return string.format("%.1f s", x) end)
 makeSection(pTuning, "TOOLS")
@@ -2109,9 +2826,11 @@ local function makeStat(name)
 	v.Size = UDim2.new(0.5, -14, 1, 0)
 	return v
 end
-local stRounds, stPasses = makeStat("Rounds"), makeStat("Passes")
-local stJumps, stClimbs, stJump = makeStat("Jumps"), makeStat("Climb hops"), makeStat("Jump in this arena")
-local stMap, stTracked, stSession = makeStat("Arena cells"), makeStat("Opponents tracked"), makeStat("Session")
+local ST = {}
+ST.rounds, ST.passes = makeStat("Rounds"), makeStat("Passes")
+ST.jumps, ST.climbs, ST.jump = makeStat("Jumps"), makeStat("Climb hops"), makeStat("Jump in this arena")
+ST.map, ST.tracked, ST.session = makeStat("Arena cells"), makeStat("Opponents tracked"), makeStat("Session")
+ST.reflex = makeStat("Reflex dodges")
 
 -- إغلاق (-) وفتح (+) القائمة | على الكمبيوتر: RightShift
 local collapsed = false
@@ -2172,6 +2891,9 @@ local function shutdown()
 	restoreShiftLockState()
 	pcall(function() RunService:UnbindFromRenderStep("TimebombAI") end)
 	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+	pcall(LG.espClear)
+	if LG.ESP.folder then pcall(function() LG.ESP.folder:Destroy() end) end
+	pcall(LG.restoreOutfit)
 	gui:Destroy()
 end
 
@@ -2201,12 +2923,17 @@ local acc, nextStep, wasInMatch, hadBomb, urgentShown, lastSlow = 0, 0.1, false,
 
 table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 	if not alive then return end
+	if Config.Reflex and Config.AI then pcall(LG.reflexStep) end -- كل فريم
 	acc += dt
 	if acc < nextStep then return end
 	acc = 0
-	nextStep = Config.Reaction + rng:NextNumber(0, 0.04)
+	nextStep = Config.Reaction + rng:NextNumber(0, 0.015)
 
 	local inMatch = isInMatch(LP)
+	if now() - LG.Outfit.lastCheck > 1.5 then
+		LG.Outfit.lastCheck = now()
+		if Config.Outfit then pcall(LG.ensureOutfit) end
+	end
 	if inMatch ~= wasInMatch then
 		wasInMatch = inMatch
 		resetAI()
@@ -2222,6 +2949,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 
 	if not inMatch then
 		clearState()
+		pcall(LG.espClear)
 		restoreShiftLockState()
 		hadBomb = false
 		setMeter(Config.AutoRestart and "WAITING / LOBBY" or "OUT OF ROUND", C.sub, nil, 0, "")
@@ -2231,6 +2959,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 	if pcall(scanPlayers) then
 		if Config.AI then pcall(aiStep) end
 		if Config.Reach then pcall(reachStep) end
+		pcall(LG.espStep)
 	end
 	if not hasBomb(LP) and not needShiftLockNow() then restoreShiftLockState() end
 
@@ -2270,18 +2999,19 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 		lastSlow = now()
 		local n = 0
 		for _ in pairs(Memory) do n += 1 end
-		stRounds.Text = tostring(Stats.rounds)
-		stPasses.Text = tostring(Stats.passes)
-		stJumps.Text = tostring(Stats.jumps)
-		stClimbs.Text = tostring(Stats.climbs)
+		ST.rounds.Text = tostring(Stats.rounds)
+		ST.passes.Text = tostring(Stats.passes)
+		ST.jumps.Text = tostring(Stats.jumps)
+		ST.climbs.Text = tostring(Stats.climbs)
+		ST.reflex.Text = tostring(Stats.reflex)
 		local _, _, mh = getCharacterParts(LP)
 		local jok = mh ~= nil and canJump(mh)
-		stJump.Text = jok and "YES" or "NO"
-		stJump.TextColor3 = jok and C.good or C.bad
-		stMap.Text = Map.ready and tostring(Map.walk) or "—"
-		stTracked.Text = tostring(n)
+		ST.jump.Text = jok and "YES" or "NO"
+		ST.jump.TextColor3 = jok and C.good or C.bad
+		ST.map.Text = Map.ready and tostring(Map.walk) or "—"
+		ST.tracked.Text = tostring(n)
 		local s = math.floor(now() - Stats.t0)
-		stSession.Text = string.format("%02d:%02d", math.floor(s / 60), s % 60)
+		ST.session.Text = string.format("%02d:%02d", math.floor(s / 60), s % 60)
 	end
 end))
 
@@ -2296,5 +3026,9 @@ end)
 
 table.insert(connections, LP.CharacterAdded:Connect(function()
 	savedAutoRotate = nil
+	if LG.Outfit.backup then
+		LG.Outfit.backup:Destroy()
+		LG.Outfit.backup = nil
+	end
 	resetAI()
 end))
