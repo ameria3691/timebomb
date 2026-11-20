@@ -11,7 +11,6 @@ local Config = {
 	AILock = false,
 	ShiftLock = false,
 	FF_071 = false,
-
 	ReachSize = 10,
 	AIDodgeDist = 28
 }
@@ -253,12 +252,10 @@ local function updateShiftLock(myChar, myHrp, myHum, dt)
 	if not myChar or not myHrp or not myHum then return end
 	local cam = workspace.CurrentCamera
 	if not cam then return end
-
 	if not savedShiftState.Active then
 		savedShiftState.AutoRotate = myHum.AutoRotate
 		savedShiftState.Active = true
 	end
-
 	pcall(function()
 		myHum.AutoRotate = false
 		local look = cam.CFrame.LookVector
@@ -272,7 +269,7 @@ local function updateShiftLock(myChar, myHrp, myHum, dt)
 end
 
 -- =========================================================
--- 3) الذكاء الاصطناعي: رادار الخطر + تمرير تكتيكي + تجنب المصائد
+-- 3) الذكاء الاصطناعي: ابتعاد فوري بعد التمرير + مراوغة منظمة + تمرير تكتيكي
 -- =========================================================
 local rowRefs = {}
 local uiStatusUpdater = nil
@@ -297,6 +294,7 @@ local cachedWaypoints = {}
 local waypointIndex = 2
 local coverHoldTimer = 0
 local hadBombLastFrame = false
+local postPassBreakTimer = 0
 
 local GROUND_JUKE_PATTERNS = {
 	"ground_bait_drift",
@@ -441,7 +439,6 @@ local function isSafeDirection(myChar, myHrp, myHum, dir, allowEdgeJump)
 	return true
 end
 
--- [إضافة 3: تجنّب الأماكن المغلقة والمصائد] فحص المساحة الحرة حول الاتجاه
 local function measureOpenSpace(myChar, originPos, dir)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -450,16 +447,13 @@ local function measureOpenSpace(myChar, originPos, dir)
 	local rightHit = workspace:Raycast(originPos, rotateFlatVector(dir, -55) * 13, params)
 	local backLeftHit = workspace:Raycast(originPos, rotateFlatVector(dir, 125) * 11, params)
 	local backRightHit = workspace:Raycast(originPos, rotateFlatVector(dir, -125) * 11, params)
-
 	local leftSpace = (leftHit and leftHit.Instance.CanCollide) and leftHit.Distance or 13
 	local rightSpace = (rightHit and rightHit.Instance.CanCollide) and rightHit.Distance or 13
 	local backLeftSpace = (backLeftHit and backLeftHit.Instance.CanCollide) and backLeftHit.Distance or 11
 	local backRightSpace = (backRightHit and backRightHit.Instance.CanCollide) and backRightHit.Distance or 11
-
 	return leftSpace + rightSpace + (backLeftSpace + backRightSpace) * 0.6
 end
 
--- [إضافة 3: تجنّب الأماكن المغلقة والمصائد] خصم نقاط الزوايا والمصائد المغلقة
 local function getCornerTrapPenalty(myChar, checkPos, dir)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -552,7 +546,6 @@ local function findDescentSpot(myChar, myHrp, targetHrp)
 	local flatToTarget = Vector3.new(targetHrp.Position.X - myHrp.Position.X, 0, targetHrp.Position.Z - myHrp.Position.Z)
 	local baseDir = (flatToTarget.Magnitude > 0.05) and flatToTarget.Unit or Vector3.new(1, 0, 0)
 	local bestSpot, bestScore = nil, -math.huge
-
 	for angOffset = -90, 90, 30 do
 		local probeDir = rotateFlatVector(baseDir, angOffset)
 		for _, dist in ipairs({4, 8, 12}) do
@@ -571,11 +564,9 @@ local function findDescentSpot(myChar, myHrp, targetHrp)
 			end
 		end
 	end
-
 	return bestSpot
 end
 
--- [إضافة 2: التمرير التكتيكي والتمويه] تقدير نقطة الاعتراض
 local function computeInterceptPoint(myHrp, myHum, targetHrp, urgentMode)
 	local tVel = targetHrp.AssemblyLinearVelocity
 	local flatVel = Vector3.new(tVel.X, 0, tVel.Z)
@@ -586,11 +577,9 @@ local function computeInterceptPoint(myHrp, myHum, targetHrp, urgentMode)
 	return targetHrp.Position + flatVel * interceptTime, flatVel
 end
 
--- [إضافة 1: رادار زوايا الخطر والانفجار المبكر] تقييم التهديدات وحساب خطر حامل القنبلة
 local function collectThreatEntities(myChar, myHrp)
 	local candidates = {}
 	local bombCarriers = {}
-
 	for _, plr in ipairs(Players:GetPlayers()) do
 		if not isTeammate(plr) then
 			local tChar, tHrp = getCharacterParts(plr)
@@ -603,7 +592,6 @@ local function collectThreatEntities(myChar, myHrp)
 				local look = tHrp.CFrame.LookVector
 				local blastLead = (carriesBomb and timerLeft and timerLeft <= 4.0) and 0.72 or (carriesBomb and 0.52 or 0.35)
 				local blastCenter = tHrp.Position + flatVel * blastLead + Vector3.new(look.X, 0, look.Z) * (carriesBomb and 3.5 or 1.5)
-
 				local entry = {
 					char = tChar,
 					hrp = tHrp,
@@ -629,11 +617,9 @@ local function collectThreatEntities(myChar, myHrp)
 				local bLook = b.hrp.CFrame.LookVector
 				local bVel = b.hrp.AssemblyLinearVelocity
 				local bFlatVel = Vector3.new(bVel.X, 0, bVel.Z)
-
 				local isCloseToBomb = bDist < 22
 				local isAimedAtByBomb = (bFlat.Magnitude > 0.2) and (bLook:Dot(bFlat.Unit) > 0.55 and bDist < 32)
 				local isBombMovingToward = (bFlat.Magnitude > 0.2) and (bFlatVel.Magnitude > 3 and bFlatVel.Unit:Dot(bFlat.Unit) > 0.55 and bDist < 28)
-
 				if isCloseToBomb or isAimedAtByBomb or isBombMovingToward then
 					c.likelyPassTarget = true
 					break
@@ -644,6 +630,7 @@ local function collectThreatEntities(myChar, myHrp)
 
 	local primaryThreat = nil
 	local highestThreatScore = -math.huge
+	local hasAnyBombCarrier = (#bombCarriers > 0)
 
 	for _, c in ipairs(candidates) do
 		local toMe = (myHrp.Position - c.hrp.Position)
@@ -652,19 +639,24 @@ local function collectThreatEntities(myChar, myHrp)
 		local vel = c.hrp.AssemblyLinearVelocity
 		local flatVel = Vector3.new(vel.X, 0, vel.Z)
 		local approachingMe = (flatToMe.Magnitude > 0.2) and ((c.hrp.CFrame.LookVector:Dot(flatToMe.Unit) > 0.30) or (flatVel.Magnitude > 2.5 and flatVel.Unit:Dot(flatToMe.Unit) > 0.40))
-
 		local score = 0
 		if c.hasBomb then
-			score += 175
-			if c.bombTime and c.bombTime <= 4.5 then score += (5.0 - c.bombTime) * 28 end
-		elseif c.likelyPassTarget then
-			score += 72
+			score += 320
+			if c.bombTime and c.bombTime <= 4.5 then score += (5.0 - c.bombTime) * 32 end
+		elseif not hasAnyBombCarrier then
+			if c.likelyPassTarget then score += 55 end
+			if c.distToMe <= math.max(Config.AIDodgeDist, 38) then score += (math.max(Config.AIDodgeDist, 38) - c.distToMe) * 3.0 end
+			if approachingMe then score += 22 end
+		else
+			-- عندما يوجد حامل قنبلة، لا نجعل خصماً عادياً يسحب الأولوية بعيداً عن حامل القنبلة
+			score -= 80
 		end
-		if c.distToMe <= math.max(Config.AIDodgeDist, 38) then score += (math.max(Config.AIDodgeDist, 38) - c.distToMe) * 4.0 end
-		if c.distToMe < 15 then score += (15 - c.distToMe) * 5.8 end
-		if approachingMe then score += 32 end
-		score -= dist * 0.38
-
+		if c.hasBomb then
+			if c.distToMe <= math.max(Config.AIDodgeDist, 42) then score += (math.max(Config.AIDodgeDist, 42) - c.distToMe) * 5.0 end
+			if c.distToMe < 18 then score += (18 - c.distToMe) * 7.5 end
+			if approachingMe then score += 45 end
+		end
+		score -= dist * 0.35
 		c.threatScore = score
 		if score > highestThreatScore then
 			highestThreatScore = score
@@ -685,11 +677,9 @@ local function evaluateDirectionScore(myChar, myHrp, dir, threats)
 	if st == "wall" then score -= (15 - wallDist) * 9.0
 	elseif st == "jumpable" then score += 10
 	else score += 30 end
-
 	local nextPos = myHrp.Position + dir * 8
 	score += measureOpenSpace(myChar, nextPos, dir) * 2.10
 	score -= getCornerTrapPenalty(myChar, nextPos, dir)
-
 	local floorHit = workspace:Raycast(myHrp.Position + dir * 8 + Vector3.new(0, 2, 0), Vector3.new(0, -18, 0), params)
 	if not floorHit then
 		score -= 140
@@ -698,16 +688,16 @@ local function evaluateDirectionScore(myChar, myHrp, dir, threats)
 	else
 		score += 14
 	end
-
 	if threats then
 		for _, t in ipairs(threats) do
 			local blastPos = t.blastCenter or t.hrp.Position
 			local distFromBlast = (nextPos - blastPos).Magnitude
-
+			local actualCarrierDist = (nextPos - t.hrp.Position).Magnitude
 			if t.hasBomb then
-				local timerBoost = (t.bombTime and t.bombTime <= 4.0) and 1.45 or 1.12
-				score += distFromBlast * 2.75 * timerBoost
-				if distFromBlast < 15 then score -= (15 - distFromBlast) * 7.8 * timerBoost end
+				local timerBoost = (t.bombTime and t.bombTime <= 4.0) and 1.55 or 1.25
+				score += distFromBlast * 3.10 * timerBoost + actualCarrierDist * 2.20
+				if distFromBlast < 18 then score -= (18 - distFromBlast) * 9.5 * timerBoost end
+				if actualCarrierDist < 14 then score -= (14 - actualCarrierDist) * 11.0 end
 				if hasCoverBetween(myChar, nextPos, blastPos) then
 					if distFromBlast < 16 and coverHoldTimer < 0.75 then
 						score += 18
@@ -716,19 +706,17 @@ local function evaluateDirectionScore(myChar, myHrp, dir, threats)
 					end
 				end
 			elseif t.likelyPassTarget then
-				score += distFromBlast * 1.45
-				if distFromBlast < 12 then score -= (12 - distFromBlast) * 4.5 end
+				score += distFromBlast * 1.15
+				if distFromBlast < 10 then score -= (10 - distFromBlast) * 3.2 end
 			else
-				score += distFromBlast * 1.05
-				if distFromBlast < 10 then score -= (10 - distFromBlast) * 3.8 end
+				score += distFromBlast * 0.85
+				if distFromBlast < 9 then score -= (9 - distFromBlast) * 2.5 end
 			end
 		end
 	end
-
 	return score
 end
 
--- [إضافة 2: التمرير التكتيكي والتمويه] اختيار أفضل هدف للتمرير
 local function pickBestPassTarget(myChar, myHrp, urgentMode)
 	local bestPlr, bestHrp, bestScore = nil, nil, math.huge
 	for _, plr in ipairs(Players:GetPlayers()) do
@@ -753,7 +741,6 @@ local function syncVerticalLevel(myChar, myHrp, myHum, targetHrp, iHaveBomb, urg
 	local flat = Vector3.new(toTarget.X, 0, toTarget.Z)
 	local flatDist = flat.Magnitude
 	local directDir = (flatDist > 0.05) and flat.Unit or Vector3.new(1, 0, 0)
-
 	if dy > 3.2 then
 		setModeTag("CLIMB UP")
 		local preferDropBait = iHaveBomb and (urgentMode or dy > 8.0 or flatDist < 6.5)
@@ -765,7 +752,6 @@ local function syncVerticalLevel(myChar, myHrp, myHum, targetHrp, iHaveBomb, urg
 			applyAIMove(myHrp, myHum, safeBaitDir, baitPos, nil, dt)
 			return true
 		end
-
 		local ascentSpot = findAscentSpot(myChar, myHrp, targetHrp)
 		if ascentSpot then
 			local spotFlat = Vector3.new(ascentSpot.X - myHrp.Position.X, 0, ascentSpot.Z - myHrp.Position.Z)
@@ -775,13 +761,11 @@ local function syncVerticalLevel(myChar, myHrp, myHum, targetHrp, iHaveBomb, urg
 			triggerJumpSkill(myHum, 0.46, safeClimb)
 			return true
 		end
-
 		if pathComputeTimer <= 0 or #cachedWaypoints == 0 then
 			pathComputeTimer = 0.35
 			local wps = computeSmartPath(myHrp.Position, targetHrp.Position)
 			if wps and #wps >= 2 then cachedWaypoints, waypointIndex = wps, 2 end
 		end
-
 		if cachedWaypoints[waypointIndex] then
 			local wp = cachedWaypoints[waypointIndex]
 			local wpFlat = Vector3.new(wp.Position.X - myHrp.Position.X, 0, wp.Position.Z - myHrp.Position.Z)
@@ -797,14 +781,12 @@ local function syncVerticalLevel(myChar, myHrp, myHum, targetHrp, iHaveBomb, urg
 				return true
 			end
 		end
-
 		local safeDirect = sanitizeDirection(myChar, myHrp, myHum, directDir, true)
 		currentTurnRate = urgentMode and 17.5 or 14.5
 		applyAIMove(myHrp, myHum, safeDirect, myHrp.Position + safeDirect * 11, targetHrp.Position, dt)
 		triggerJumpSkill(myHum, 0.48, safeDirect)
 		return true
 	end
-
 	if dy < -3.2 then
 		setModeTag("DROP DOWN")
 		local descentSpot = findDescentSpot(myChar, myHrp, targetHrp)
@@ -816,13 +798,11 @@ local function syncVerticalLevel(myChar, myHrp, myHum, targetHrp, iHaveBomb, urg
 			applyAIMove(myHrp, myHum, safeDrop, descentSpot, targetHrp.Position, dt)
 			return true
 		end
-
 		if pathComputeTimer <= 0 or #cachedWaypoints == 0 then
 			pathComputeTimer = 0.35
 			local wps = computeSmartPath(myHrp.Position, targetHrp.Position)
 			if wps and #wps >= 2 then cachedWaypoints, waypointIndex = wps, 2 end
 		end
-
 		if cachedWaypoints[waypointIndex] then
 			local wp = cachedWaypoints[waypointIndex]
 			local wpFlat = Vector3.new(wp.Position.X - myHrp.Position.X, 0, wp.Position.Z - myHrp.Position.Z)
@@ -835,17 +815,14 @@ local function syncVerticalLevel(myChar, myHrp, myHum, targetHrp, iHaveBomb, urg
 				return true
 			end
 		end
-
 		local safeDownDir = sanitizeDirection(myChar, myHrp, myHum, directDir, true)
 		currentTurnRate = urgentMode and 17.5 or 14.5
 		applyAIMove(myHrp, myHum, safeDownDir, targetHrp.Position, targetHrp.Position, dt)
 		return true
 	end
-
 	return false
 end
 
--- [إضافة 2: التمرير التكتيكي والتمويه] مطاردة مع خداع تمويهي ثم حسم مباشر
 local function chaseAndPassToTarget(myChar, myHrp, myHum, targetHrp, urgentMode, dt)
 	if syncVerticalLevel(myChar, myHrp, myHum, targetHrp, true, urgentMode, dt) then return end
 	setModeTag("CHASE PASS")
@@ -854,15 +831,12 @@ local function chaseAndPassToTarget(myChar, myHrp, myHum, targetHrp, urgentMode,
 	local flat = Vector3.new(toTarget.X, 0, toTarget.Z)
 	local distFlat = flat.Magnitude
 	local directDir = (distFlat > 0.05) and flat.Unit or Vector3.new(1, 0, 0)
-
 	if distFlat <= 12.0 or urgentMode then
 		needShiftLockNow = true
 	end
-
 	local predDelta = cutOffPos - myHrp.Position
 	local predFlat = Vector3.new(predDelta.X, 0, predDelta.Z)
 	local aimDir = (predFlat.Magnitude > 0.05) and predFlat.Unit or directDir
-
 	local obstacleType = probeObstacle(myChar, myHrp, aimDir, math.min(distFlat, 16))
 	local chosenDir, moveTargetPos = aimDir, cutOffPos
 	if distFlat <= 7.5 then
@@ -904,85 +878,81 @@ end
 local function buildGroundJukeDir(awayDir, bestSafeDir)
 	local sideDir = Vector3.new(-awayDir.Z * jukeSign, 0, awayDir.X * jukeSign)
 	local oppSideDir = Vector3.new(-awayDir.Z * (-jukeSign), 0, awayDir.X * (-jukeSign))
-	local waveFast = math.sin(arcPhaseClock * 13.5) * 0.38
-	local waveSlow = math.cos(arcPhaseClock * 7.8) * 0.30
-
+	local waveFast = math.sin(arcPhaseClock * 11.0) * 0.28
+	local waveSlow = math.cos(arcPhaseClock * 6.8) * 0.24
 	if jukePhase == "ground_bait_drift" then
-		return (sideDir * (0.90 + waveSlow) + bestSafeDir * 0.38 + awayDir * 0.14).Unit
+		return (awayDir * 0.72 + bestSafeDir * 0.45 + sideDir * (0.58 + waveSlow)).Unit
 	elseif jukePhase == "ground_snap_cut" then
-		return (oppSideDir * (0.98 - waveFast) + awayDir * 0.65 + bestSafeDir * 0.28).Unit
+		return (awayDir * 0.80 + bestSafeDir * 0.42 + oppSideDir * (0.62 - waveFast)).Unit
 	elseif jukePhase == "ground_crescent_arc" then
-		return (rotateFlatVector(sideDir, 38 * math.sin(arcPhaseClock * 9.0) * jukeSign) * 0.88 + awayDir * 0.58 + bestSafeDir * 0.25).Unit
+		return (awayDir * 0.74 + rotateFlatVector(sideDir, 30 * math.sin(arcPhaseClock * 7.5) * jukeSign) * 0.62 + bestSafeDir * 0.35).Unit
 	elseif jukePhase == "ground_zig_pulse" then
-		local pulse = (math.floor(arcPhaseClock * 11.0) % 2 == 0) and 1 or -1
-		return (rotateFlatVector(sideDir, 54 * pulse) * 0.95 + awayDir * 0.54 + bestSafeDir * 0.24).Unit
+		local pulse = (math.floor(arcPhaseClock * 6.5) % 2 == 0) and 1 or -1
+		return (awayDir * 0.76 + rotateFlatVector(sideDir, 38 * pulse) * 0.60 + bestSafeDir * 0.35).Unit
 	elseif jukePhase == "ground_hook_feint" then
-		return (rotateFlatVector(awayDir, 64 * jukeSign) * 0.84 + bestSafeDir * 0.62).Unit
+		return (awayDir * 0.78 + rotateFlatVector(awayDir, 45 * jukeSign) * 0.55 + bestSafeDir * 0.50).Unit
 	elseif jukePhase == "ground_flank_dash" then
-		return (rotateFlatVector(awayDir, 78 * jukeSign + math.cos(arcPhaseClock * 10.5) * 18) * 0.86 + bestSafeDir * 0.52).Unit
+		return (awayDir * 0.75 + rotateFlatVector(awayDir, 55 * jukeSign + math.cos(arcPhaseClock * 8.0) * 14) * 0.58 + bestSafeDir * 0.45).Unit
 	elseif jukePhase == "ground_pivot_backstep" then
-		return (rotateFlatVector(awayDir, 130 * jukeSign + math.sin(arcPhaseClock * 9.5) * 16) * 0.88 + bestSafeDir * 0.56).Unit
+		return (awayDir * 0.85 + rotateFlatVector(awayDir, 85 * jukeSign) * 0.48 + bestSafeDir * 0.48).Unit
 	elseif jukePhase == "ground_serpentine_weave" then
-		local weaveDeg = math.sin(arcPhaseClock * 14.5) * 62 * jukeSign
-		return (rotateFlatVector(awayDir, weaveDeg) * 0.80 + sideDir * 0.58 + bestSafeDir * 0.34).Unit
+		local weaveDeg = math.sin(arcPhaseClock * 9.5) * 38 * jukeSign
+		return (awayDir * 0.78 + rotateFlatVector(awayDir, weaveDeg) * 0.52 + bestSafeDir * 0.42).Unit
 	elseif jukePhase == "ground_stop_and_slip" then
-		local slipAngle = (math.floor(arcPhaseClock * 7.0) % 2 == 0) and (95 * jukeSign) or (-78 * jukeSign)
-		return (rotateFlatVector(awayDir, slipAngle) * 0.86 + bestSafeDir * 0.55).Unit
+		local slipAngle = (math.floor(arcPhaseClock * 5.5) % 2 == 0) and (58 * jukeSign) or (-48 * jukeSign)
+		return (awayDir * 0.76 + rotateFlatVector(awayDir, slipAngle) * 0.54 + bestSafeDir * 0.48).Unit
 	elseif jukePhase == "ground_wide_sweep" then
-		return (rotateFlatVector(sideDir, 28 * jukeSign) * 0.95 + awayDir * 0.45 + bestSafeDir * 0.42).Unit
+		return (awayDir * 0.72 + rotateFlatVector(sideDir, 22 * jukeSign) * 0.64 + bestSafeDir * 0.42).Unit
 	elseif jukePhase == "chaos_feint_reverse" then
-		local phaseFlip = (math.floor(arcPhaseClock * 8.0) % 2 == 0) and 1 or -1
-		return (rotateFlatVector(awayDir, 90 * jukeSign * phaseFlip) * 0.90 + bestSafeDir * 0.48).Unit
+		local phaseFlip = (math.floor(arcPhaseClock * 5.8) % 2 == 0) and 1 or -1
+		return (awayDir * 0.78 + rotateFlatVector(awayDir, 54 * jukeSign * phaseFlip) * 0.55 + bestSafeDir * 0.45).Unit
 	elseif jukePhase == "pendulum_slash" then
-		local swing = math.sin(arcPhaseClock * 14.0) * 80 * jukeSign
-		return (rotateFlatVector(awayDir, swing) * 0.85 + oppSideDir * 0.45).Unit
+		local swing = math.sin(arcPhaseClock * 9.0) * 44 * jukeSign
+		return (awayDir * 0.78 + rotateFlatVector(awayDir, swing) * 0.54 + bestSafeDir * 0.42).Unit
 	elseif jukePhase == "stagger_step_cut" then
-		local tick = math.floor(arcPhaseClock * 9.5) % 3
-		local ang = (tick == 0 and 38 or (tick == 1 and -88 or 112)) * jukeSign
-		return (rotateFlatVector(awayDir, ang) * 0.88 + bestSafeDir * 0.45).Unit
+		local tick = math.floor(arcPhaseClock * 6.0) % 3
+		local ang = (tick == 0 and 28 or (tick == 1 and -52 or 62)) * jukeSign
+		return (awayDir * 0.78 + rotateFlatVector(awayDir, ang) * 0.52 + bestSafeDir * 0.45).Unit
 	elseif jukePhase == "blindspot_wrap" then
-		return (rotateFlatVector(awayDir, 98 * jukeSign + math.sin(arcPhaseClock * 8.5) * 20) * 0.92 + sideDir * 0.35).Unit
+		return (awayDir * 0.76 + rotateFlatVector(awayDir, 60 * jukeSign + math.sin(arcPhaseClock * 7.0) * 14) * 0.58 + bestSafeDir * 0.40).Unit
 	elseif jukePhase == "double_brake_turn" then
-		local pulse = (math.floor(arcPhaseClock * 8.5) % 2 == 0) and -108 or 68
-		return (rotateFlatVector(awayDir, pulse * jukeSign) * 0.87 + bestSafeDir * 0.50).Unit
+		local pulse = (math.floor(arcPhaseClock * 6.0) % 2 == 0) and -62 or 45
+		return (awayDir * 0.78 + rotateFlatVector(awayDir, pulse * jukeSign) * 0.54 + bestSafeDir * 0.45).Unit
 	elseif jukePhase == "spiral_breakout" then
-		local spiralDeg = 44 * jukeSign + math.cos(arcPhaseClock * 11.5) * 50
-		return (rotateFlatVector(awayDir, spiralDeg) * 0.84 + bestSafeDir * 0.56).Unit
+		local spiralDeg = 32 * jukeSign + math.cos(arcPhaseClock * 8.0) * 28
+		return (awayDir * 0.76 + rotateFlatVector(awayDir, spiralDeg) * 0.52 + bestSafeDir * 0.48).Unit
 	end
-
-	return (bestSafeDir * 0.66 + awayDir * 0.38 + sideDir * (0.56 + waveSlow)).Unit
+	return (bestSafeDir * 0.65 + awayDir * 0.75 + sideDir * (0.42 + waveSlow)).Unit
 end
 
 local function buildJumpJukeDir(awayDir, bestSafeDir)
 	local sideDir = Vector3.new(-awayDir.Z * jukeSign, 0, awayDir.X * jukeSign)
 	local oppSideDir = Vector3.new(-awayDir.Z * (-jukeSign), 0, awayDir.X * (-jukeSign))
-	local hopWave = math.sin(arcPhaseClock * 12.0) * 0.32
-
+	local hopWave = math.sin(arcPhaseClock * 9.5) * 0.25
 	if jukePhase == "jump_snap_cross" then
-		return (oppSideDir * 0.96 + awayDir * 0.64 + bestSafeDir * 0.28).Unit
+		return (awayDir * 0.80 + oppSideDir * 0.58 + bestSafeDir * 0.40).Unit
 	elseif jukePhase == "jump_flank_vault" then
-		return (rotateFlatVector(awayDir, 70 * jukeSign) * 0.86 + bestSafeDir * 0.54).Unit
+		return (awayDir * 0.78 + rotateFlatVector(awayDir, 48 * jukeSign) * 0.55 + bestSafeDir * 0.48).Unit
 	elseif jukePhase == "jump_crescent_hop" then
-		return (rotateFlatVector(sideDir, 38 * jukeSign + hopWave * 42) * 0.90 + awayDir * 0.55).Unit
+		return (awayDir * 0.76 + rotateFlatVector(sideDir, 28 * jukeSign + hopWave * 30) * 0.60 + bestSafeDir * 0.35).Unit
 	elseif jukePhase == "jump_feint_hop" then
-		return (rotateFlatVector(sideDir, -40 * jukeSign) * 0.85 + bestSafeDir * 0.55).Unit
+		return (awayDir * 0.80 + rotateFlatVector(sideDir, -28 * jukeSign) * 0.52 + bestSafeDir * 0.48).Unit
 	elseif jukePhase == "jump_back_angle" then
-		return (rotateFlatVector(awayDir, 124 * jukeSign) * 0.88 + bestSafeDir * 0.52).Unit
+		return (awayDir * 0.84 + rotateFlatVector(awayDir, 72 * jukeSign) * 0.50 + bestSafeDir * 0.46).Unit
 	elseif jukePhase == "jump_zig_hop" then
-		local zig = (math.floor(arcPhaseClock * 9.5) % 2 == 0) and 58 or -58
-		return (rotateFlatVector(awayDir, zig * jukeSign) * 0.84 + bestSafeDir * 0.52).Unit
+		local zig = (math.floor(arcPhaseClock * 6.5) % 2 == 0) and 38 or -38
+		return (awayDir * 0.78 + rotateFlatVector(awayDir, zig * jukeSign) * 0.52 + bestSafeDir * 0.45).Unit
 	elseif jukePhase == "jump_gap_slip" then
-		return (bestSafeDir * 0.78 + sideDir * (0.50 + hopWave)).Unit
+		return (bestSafeDir * 0.72 + awayDir * 0.68 + sideDir * (0.36 + hopWave)).Unit
 	elseif jukePhase == "jump_over_pressure" then
-		return (rotateFlatVector(awayDir, 60 * jukeSign) * 0.88 + bestSafeDir * 0.50).Unit
+		return (awayDir * 0.80 + rotateFlatVector(awayDir, 42 * jukeSign) * 0.54 + bestSafeDir * 0.45).Unit
 	elseif jukePhase == "jump_chaos_twist" then
-		local twist = (math.floor(arcPhaseClock * 8.0) % 2 == 0) and 88 or -78
-		return (rotateFlatVector(awayDir, twist * jukeSign) * 0.90 + oppSideDir * 0.40).Unit
+		local twist = (math.floor(arcPhaseClock * 6.0) % 2 == 0) and 54 or -48
+		return (awayDir * 0.78 + rotateFlatVector(awayDir, twist * jukeSign) * 0.55 + bestSafeDir * 0.42).Unit
 	elseif jukePhase == "jump_double_cut_hop" then
-		return (rotateFlatVector(awayDir, 105 * jukeSign + math.sin(arcPhaseClock * 10.5) * 26) * 0.86 + bestSafeDir * 0.50).Unit
+		return (awayDir * 0.78 + rotateFlatVector(awayDir, 62 * jukeSign + math.sin(arcPhaseClock * 8.0) * 18) * 0.54 + bestSafeDir * 0.45).Unit
 	end
-
-	return (bestSafeDir * 0.65 + awayDir * 0.45 + sideDir * 0.52).Unit
+	return (bestSafeDir * 0.65 + awayDir * 0.75 + sideDir * 0.40).Unit
 end
 
 local function buildLegendaryJukeDir(awayDir, bestSafeDir)
@@ -993,21 +963,20 @@ local function buildLegendaryJukeDir(awayDir, bestSafeDir)
 end
 
 local function pickNextJukePattern(nearestDist, threatApproaching, urgentTimer, enemyHasBomb)
-	local rateBoost = urgentTimer and 2.2 or (enemyHasBomb and 1.2 or 0.5)
-	local jumpChance = enemyHasBomb and (urgentTimer and 52 or 44) or (nearestDist < 13 and 38 or (threatApproaching and 32 or 22))
+	local rateBoost = urgentTimer and 1.8 or (enemyHasBomb and 1.0 or 0.4)
+	local jumpChance = enemyHasBomb and (urgentTimer and 40 or 32) or (nearestDist < 12 and 28 or (threatApproaching and 24 or 16))
 	jukeIsJumpMode = (math.random(1, 100) <= jumpChance)
-
 	if jukeIsJumpMode then
 		local idx = math.random(1, #JUMP_JUKE_PATTERNS)
 		jukePhase = JUMP_JUKE_PATTERNS[idx]
-		jukeTimer = enemyHasBomb and (math.random(14, 24) / 100) or (math.random(20, 34) / 100)
-		currentTurnRate = 18.0 + rateBoost
+		jukeTimer = enemyHasBomb and (math.random(24, 38) / 100) or (math.random(28, 44) / 100)
+		currentTurnRate = 15.5 + rateBoost
 		setModeTag("JUMP JUKE")
 	else
 		local idx = math.random(1, #GROUND_JUKE_PATTERNS)
 		jukePhase = GROUND_JUKE_PATTERNS[idx]
-		jukeTimer = enemyHasBomb and (math.random(12, 22) / 100) or (math.random(16, 32) / 100)
-		currentTurnRate = (nearestDist < 14 and 17.8 or 15.8) + rateBoost
+		jukeTimer = enemyHasBomb and (math.random(22, 36) / 100) or (math.random(26, 42) / 100)
+		currentTurnRate = (nearestDist < 14 and 15.2 or 13.8) + rateBoost
 		setModeTag("GROUND JUKE")
 	end
 end
@@ -1019,15 +988,20 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 
 	if not Config.AI or not isInMatch(myChar, myHrp) then
 		hadBombLastFrame = false
+		postPassBreakTimer = 0
 		setModeTag("STANDBY")
 		return
 	end
 
 	local iHaveBombNow = hasBomb(myChar)
+	-- لحظة إعطاء القنبلة للخصم: كسر الاتجاه السابق والابتعاد الفوري بقوة بعيداً عنه
 	if hadBombLastFrame and not iHaveBombNow then
 		lockedMoveDir = nil
 		jukeTimer = 0
+		jukePhase = "none"
+		jukeIsJumpMode = false
 		humanReactionDelay = 0
+		postPassBreakTimer = 1.15
 		restoreShiftLockState(myChar)
 		enforceHealthyMoveSpeed(myHum)
 	end
@@ -1039,19 +1013,31 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 	targetLockTimer = math.max(0, targetLockTimer - dt)
 	pathComputeTimer = math.max(0, pathComputeTimer - dt)
 	humanReactionDelay = math.max(0, humanReactionDelay - dt)
+	postPassBreakTimer = math.max(0, postPassBreakTimer - dt)
 
 	if lastPos then
-		if (myHrp.Position - lastPos).Magnitude < 0.08 and myHum.WalkSpeed > 2 then stuckTimer += dt else stuckTimer = 0 end
+		if (myHrp.Position - lastPos).Magnitude < 0.08 and myHum.WalkSpeed > 2 then
+			stuckTimer += dt
+		else
+			stuckTimer = 0
+		end
 	end
 	lastPos = myHrp.Position
 
 	if stuckTimer > 0.28 then
-		stuckTimer, jukeSign, jukeIsJumpMode, jukePhase, jukeTimer, currentTurnRate, cachedWaypoints = 0, -jukeSign, true, "jump_chaos_twist", 0.25, 18.5, {}
+		stuckTimer = 0
+		jukeSign = -jukeSign
+		jukeIsJumpMode = true
+		jukePhase = "jump_chaos_twist"
+		jukeTimer = 0.25
+		currentTurnRate = 16.5
+		cachedWaypoints = {}
 		setModeTag("JUMP JUKE")
-		triggerJumpSkill(myHum, 0.48, rotateFlatVector(currentMoveDir, 58 * jukeSign))
+		triggerJumpSkill(myHum, 0.48, rotateFlatVector(currentMoveDir, 45 * jukeSign))
 	end
 
 	if iHaveBombNow then
+		postPassBreakTimer = 0
 		jukePhase = "none"
 		jukeIsJumpMode = false
 		coverHoldTimer = 0
@@ -1082,7 +1068,7 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 		local enemyHasBomb = (activeThreat and activeThreat.hasBomb) or false
 		local bombTimeLeft = enemyHasBomb and activeThreat.bombTime or nil
 		local urgentTimer = (bombTimeLeft ~= nil and bombTimeLeft <= 3.5)
-		local effectiveDodgeDist = enemyHasBomb and math.max(Config.AIDodgeDist, 38) or Config.AIDodgeDist
+		local effectiveDodgeDist = enemyHasBomb and math.max(Config.AIDodgeDist, 42) or Config.AIDodgeDist
 
 		if threatHrp and hasCoverBetween(myChar, myHrp.Position, threatHrp.Position) and nearestDist < 18 then
 			coverHoldTimer += dt
@@ -1090,29 +1076,58 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 			coverHoldTimer = math.max(0, coverHoldTimer - dt * 1.5)
 		end
 
+		-- بعد التمرير مباشرة: ابتعاد فوري ومستقر بعيداً عن حامل القنبلة بدون زجزاج بجانبه
+		if threatHrp and enemyHasBomb and postPassBreakTimer > 0 then
+			setModeTag("BREAKAWAY")
+			local breakFlat = Vector3.new(myHrp.Position.X - threatHrp.Position.X, 0, myHrp.Position.Z - threatHrp.Position.Z)
+			local breakAway = (breakFlat.Magnitude > 0.05) and breakFlat.Unit or rotateFlatVector(currentMoveDir, 180)
+			local bestBreakDir, bestBreakScore = breakAway, -math.huge
+			for _, deg in ipairs({0, 22, -22, 45, -45, 70, -70}) do
+				local cand = rotateFlatVector(breakAway, deg)
+				local sc = evaluateDirectionScore(myChar, myHrp, cand, threats) + cand:Dot(breakAway) * 35
+				if sc > bestBreakScore then
+					bestBreakScore, bestBreakDir = sc, cand
+				end
+			end
+			local safeBreak = sanitizeDirection(myChar, myHrp, myHum, bestBreakDir)
+			lockedMoveDir = safeBreak
+			currentTurnRate = 17.0
+			applyAIMove(myHrp, myHum, safeBreak, myHrp.Position + safeBreak * 16, nil, dt)
+			return
+		end
+
 		if threatHrp and nearestDist <= effectiveDodgeDist and math.abs(threatHrp.Position.Y - myHrp.Position.Y) > 3.5 then
 			syncVerticalLevel(myChar, myHrp, myHum, threatHrp, false, urgentTimer, dt)
 			return
 		end
 
+		-- خطر قريب جداً: اهرب وأبعد بوضوح بدل التذبذب والزجزاج السريع بجانب الخصم
 		local highDangerNow = activeThreat and (
-			(enemyHasBomb and (urgentTimer or nearestDist < 9.5))
-			or (not enemyHasBomb and activeThreat.likelyPassTarget and nearestDist < 9.5)
-			or (not enemyHasBomb and nearestDist < 7.5)
+			(enemyHasBomb and (urgentTimer or nearestDist < 11.5))
+			or (not enemyHasBomb and activeThreat.likelyPassTarget and nearestDist < 7.0)
+			or (not enemyHasBomb and nearestDist < 5.5)
 		)
 
 		if highDangerNow then
-			needShiftLockNow = true
+			needShiftLockNow = enemyHasBomb and (urgentTimer or nearestDist < 9.5)
 			setModeTag("EVADE")
-			local awayFlat = Vector3.new(myHrp.Position.X - blastPos.X, 0, myHrp.Position.Z - blastPos.Z)
+			local refPos = enemyHasBomb and threatHrp.Position or blastPos
+			local awayFlat = Vector3.new(myHrp.Position.X - refPos.X, 0, myHrp.Position.Z - refPos.Z)
 			local awayDir = (awayFlat.Magnitude > 0.05) and awayFlat.Unit or Vector3.new(1, 0, 0)
-			local quickFlip = (math.floor(arcPhaseClock * (urgentTimer and 13 or 11)) % 2 == 0) and 1 or -1
-			local safeEscape = sanitizeDirection(myChar, myHrp, myHum, rotateFlatVector(awayDir, (62 * jukeSign * quickFlip) + math.sin(arcPhaseClock * 13) * 26))
-			currentTurnRate = urgentTimer and 20.5 or 18.5
-			applyAIMove(myHrp, myHum, safeEscape, myHrp.Position + safeEscape * 13, myHrp.Position + safeEscape * 9, dt)
-			if nearestDist < 12 and math.random(1, 100) <= (urgentTimer and 78 or 60) then
-				triggerJumpSkill(myHum, 0.46, safeEscape)
-				jukeSign = -jukeSign
+			local bestEvadeDir, bestEvadeScore = awayDir, -math.huge
+			for _, deg in ipairs({0, 25, -25, 50, -50, 75, -75}) do
+				local cand = rotateFlatVector(awayDir, deg)
+				local sc = evaluateDirectionScore(myChar, myHrp, cand, threats) + cand:Dot(awayDir) * 30
+				if sc > bestEvadeScore then
+					bestEvadeScore, bestEvadeDir = sc, cand
+				end
+			end
+			local safeEscape = sanitizeDirection(myChar, myHrp, myHum, bestEvadeDir)
+			lockedMoveDir = safeEscape
+			currentTurnRate = urgentTimer and 18.0 or 16.0
+			applyAIMove(myHrp, myHum, safeEscape, myHrp.Position + safeEscape * 15, nil, dt)
+			if enemyHasBomb and nearestDist < 9.0 and math.random(1, 100) <= (urgentTimer and 55 or 35) then
+				triggerJumpSkill(myHum, 0.50, safeEscape)
 			end
 			return
 		end
@@ -1120,7 +1135,7 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 		if Config.AILock and lockedMoveDir then
 			setModeTag("LOCKED")
 			local safeLocked = sanitizeDirection(myChar, myHrp, myHum, lockedMoveDir)
-			currentTurnRate = 16.5
+			currentTurnRate = 15.0
 			applyAIMove(myHrp, myHum, safeLocked, myHrp.Position + safeLocked * 12, myHrp.Position + safeLocked * 9, dt)
 			return
 		end
@@ -1134,41 +1149,33 @@ local function runSmartAI(myChar, myHrp, myHum, dt)
 		end
 
 		if threatHrp and nearestDist <= effectiveDodgeDist then
-			local awayFlat = Vector3.new(myHrp.Position.X - blastPos.X, 0, myHrp.Position.Z - blastPos.Z)
+			local awayFlat = Vector3.new(myHrp.Position.X - threatHrp.Position.X, 0, myHrp.Position.Z - threatHrp.Position.Z)
 			local awayDir = (awayFlat.Magnitude > 0.05) and awayFlat.Unit or bestDir
 			local toMe = (myHrp.Position - threatHrp.Position).Unit
 			local tFlatVel = Vector3.new(threatHrp.AssemblyLinearVelocity.X, 0, threatHrp.AssemblyLinearVelocity.Z)
 			local approachingMe = (threatHrp.CFrame.LookVector:Dot(toMe) > 0.25) or (tFlatVel.Magnitude > 2.5 and tFlatVel.Unit:Dot(toMe) > 0.40)
 
-			if enemyHasBomb and (approachingMe or nearestDist < 16.5 or urgentTimer) then
+			if enemyHasBomb and (approachingMe or nearestDist < 15.0 or urgentTimer) then
 				needShiftLockNow = true
 			end
 
 			if jukeTimer <= 0 and humanReactionDelay <= 0 then
-				humanReactionDelay = urgentTimer and 0.02 or (enemyHasBomb and 0.04 or (math.random(5, 12) / 100))
-				jukeSign = (math.random(1, 100) <= (enemyHasBomb and 84 or 78)) and -jukeSign or ((math.random(1, 2) == 1) and 1 or -1)
+				humanReactionDelay = urgentTimer and 0.03 or (enemyHasBomb and 0.06 or (math.random(7, 14) / 100))
+				if math.random(1, 100) <= 65 then
+					jukeSign = -jukeSign
+				end
 				pickNextJukePattern(nearestDist, approachingMe, urgentTimer, enemyHasBomb)
 			end
 
 			local jukeDir = buildLegendaryJukeDir(awayDir, bestDir)
-			if enemyHasBomb and (math.floor(arcPhaseClock * 10.0) % 2 == 0) then
-				jukeDir = rotateFlatVector(jukeDir, 28 * jukeSign)
+			if jukeDir:Dot(awayDir) < 0.25 then
+				jukeDir = (jukeDir + awayDir * 0.85).Unit
 			end
-
 			local safeJuke = sanitizeDirection(myChar, myHrp, myHum, jukeDir)
 			lockedMoveDir = safeJuke
-			applyAIMove(myHrp, myHum, safeJuke, myHrp.Position + safeJuke * 12, (nearestDist < 14 or urgentTimer) and (myHrp.Position + safeJuke * 9) or nil, dt)
-
-			if jukeIsJumpMode and nearestDist < (enemyHasBomb and 24 or 19) then
-				triggerJumpSkill(myHum, 0.46, safeJuke)
-			elseif enemyHasBomb and nearestDist < 18 and math.random(1, 100) <= 62 then
-				jukeSign, jukeIsJumpMode, jukePhase, jukeTimer, currentTurnRate = -jukeSign, true, "jump_chaos_twist", 0.22, 19.0
-				setModeTag("JUMP JUKE")
-				triggerJumpSkill(myHum, 0.46, rotateFlatVector(safeJuke, 50 * jukeSign))
-			elseif nearestDist < 13.5 and approachingMe and math.random(1, 100) <= 55 then
-				jukeSign, jukeIsJumpMode, jukePhase, jukeTimer, currentTurnRate = -jukeSign, true, "jump_chaos_twist", 0.24, 18.5
-				setModeTag("JUMP JUKE")
-				triggerJumpSkill(myHum, 0.46, rotateFlatVector(safeJuke, 45 * jukeSign))
+			applyAIMove(myHrp, myHum, safeJuke, myHrp.Position + safeJuke * 14, (nearestDist < 14 or urgentTimer) and (myHrp.Position + safeJuke * 9) or nil, dt)
+			if jukeIsJumpMode and nearestDist < (enemyHasBomb and 22 or 17) then
+				triggerJumpSkill(myHum, 0.48, safeJuke)
 			end
 		else
 			jukePhase, jukeIsJumpMode, currentTurnRate = "none", false, 12.5
@@ -1195,7 +1202,6 @@ end
 local function buildUI()
 	local oldGui = playerGui:FindFirstChild("MatchPanelUI")
 	if oldGui then oldGui:Destroy() end
-
 	local ScreenGui = Instance.new("ScreenGui")
 	ScreenGui.Name = "MatchPanelUI"
 	ScreenGui.ResetOnSpawn = false
@@ -1338,7 +1344,7 @@ local function buildUI()
 		if tag == "JUMP JUKE" or tag == "CLIMB UP" then
 			StatusText.TextColor3 = Color3.fromRGB(120, 235, 255)
 			StatusDot.BackgroundColor3 = Color3.fromRGB(70, 210, 255)
-		elseif tag == "DROP DOWN" or tag == "EVADE" then
+		elseif tag == "DROP DOWN" or tag == "EVADE" or tag == "BREAKAWAY" then
 			StatusText.TextColor3 = Color3.fromRGB(255, 200, 95)
 			StatusDot.BackgroundColor3 = Color3.fromRGB(255, 180, 60)
 		else
@@ -1375,7 +1381,6 @@ local function buildUI()
 
 		local hasStepper = valueConfig ~= nil
 		local toggleWidth = hasStepper and 136 or 260
-
 		local toggleBtn = Instance.new("TextButton")
 		toggleBtn.Size = UDim2.new(0, toggleWidth, 1, -8)
 		toggleBtn.Position = UDim2.new(0, 4, 0, 4)
@@ -1452,6 +1457,7 @@ local function buildUI()
 		Config.AI = s
 		needShiftLockNow = false
 		hadBombLastFrame = false
+		postPassBreakTimer = 0
 		cachedWaypoints, jukePhase, jukeIsJumpMode, coverHoldTimer = {}, "none", false, 0
 		setModeTag(s and "ROAM" or "OFF")
 		if not s then
@@ -1513,6 +1519,7 @@ LocalPlayer.CharacterAdded:Connect(function(newChar)
 	savedShiftState.AutoRotate = nil
 	needShiftLockNow = false
 	hadBombLastFrame = false
+	postPassBreakTimer = 0
 	if Config.FF_071 then
 		task.wait(0.25)
 		applyCustomLocalStyle(newChar)
@@ -1525,7 +1532,6 @@ RunService.RenderStepped:Connect(function(dt)
 	if stepAccum < 0.08 then return end
 	local elapsed = stepAccum
 	stepAccum = 0
-
 	local myChar, myHrp, myHum = getCharacterParts(LocalPlayer)
 	if not myChar or not myHrp or not myHum then return end
 	if Config.FF_071 then applyCustomLocalStyle(myChar) end
@@ -1534,6 +1540,7 @@ RunService.RenderStepped:Connect(function(dt)
 	else
 		needShiftLockNow = false
 		hadBombLastFrame = false
+		postPassBreakTimer = 0
 	end
 	updateShiftLock(myChar, myHrp, myHum, elapsed)
 end)
