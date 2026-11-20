@@ -1,10 +1,11 @@
---// TIMEBOMB AI v6 · LEGEND+ EDITION
+--// TIMEBOMB AI v6 · LEGEND+ EDITION (FULL & TUNED)
 --// Time Calc | Edge Analysis | Opponent Memory | Smart Flee | Dodge Skills | Jump Dodges | Auto Climb + Ladders | Reflex System | ESP | Outfit Copy | Safe Zone | CamTrack | Radar UI
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
+local PathfindingService = game:GetService("PathfindingService")
 
 local LP = Players.LocalPlayer
 local rng = Random.new()
@@ -23,18 +24,18 @@ local Config = {
 	Climb = true,       -- يطلع فوق لو الخصم فوق
 	JumpDodge = true,   -- مراوغات القفز (تشتغل فقط لو القفز ممكن في الساحة)
 	JumpRate = 0.6,     -- كثرة مراوغات القفز
-	Immunity = 2.5,     -- مدة حماية اللي مرر لك (ما تقدر ترجعها له)
-	PassRange = 12,
-	FleeRange = 16.5,
-	ReachDistance = 14,
-	Reaction = 0.05,
-	Aggro = 0.6,
+	Immunity = 2.0,     -- مدة حماية اللي مرر لك (ما تقدر ترجعها له)
+	PassRange = 13.5,
+	FleeRange = 17.5,
+	ReachDistance = 15,
+	Reaction = 0.045,
+	Aggro = 0.68,
 	UrgentTime = 4,
 	YTolerance = 60,      -- فرق الارتفاع المسموح بين اللاعبين في نفس الساحة (ساحات القفز طويلة)
 	MapYTolerance = 14,   -- ارتفاع خلايا الخريطة (تحليل الحافات)
 	Ladder = true,        -- تسلق السلالم (Truss)
 	Reflex = true,        -- ردة فعل خارقة: يراوغ لحظة وصول المطارد
-	ReflexWindow = 0.5,   -- كم ثانية قبل الاصطدام يبدأ الريفلكس
+	ReflexWindow = 0.52,  -- كم ثانية قبل الاصطدام يبدأ الريفلكس
 	SafeZone = true,      -- يتمركز بمكان آمن بعيد عن الزوايا لما القنبلة بعيدة
 	ESP = true,           -- كشف اللاعبين اللي معك بنفس الساحة فقط
 	Outfit = false,       -- نسخ ملابس لاعب (يظهر عندك فقط)
@@ -69,7 +70,7 @@ local State = {
 	arenaCenter = nil, focus = nil, focusDist = math.huge,
 	peak = 0, lastHT = 0, lockedTarget = nil, dots = {}, lastThreat = nil, lastThreatT = 0, stalk = nil,
 }
-local Style = { mode = "", name = "", untilT = 0, phaseT = 0, dir = 1, period = 0.4, cache = nil, cacheT = 0, lastSide = 0, nextJump = 0 }
+local Style = { mode = "", name = "", untilT = 0, phaseT = 0, dir = 1, period = 0.4, cache = nil, cacheT = 0, lastSide = 0, nextJump = 0, data = nil }
 local Stats = { rounds = 0, passes = 0, jumps = 0, climbs = 0, reflex = 0, t0 = os.clock() }
 local LG = {} -- مساحة أسماء للميزات الجديدة (حد 200 متغير محلي بلوا)
 
@@ -108,13 +109,13 @@ local function nameIsBomb(name)
 end
 
 local function findBombObject(plr)
-	local char = plr.Character
+	local char = plr and plr.Character
 	if char then
 		for _, c in ipairs(char:GetChildren()) do
 			if (c:IsA("Tool") or c:IsA("Model") or c:IsA("BasePart")) and nameIsBomb(c.Name) then return c end
 		end
 	end
-	local bp = plr:FindFirstChildOfClass("Backpack")
+	local bp = plr and plr:FindFirstChildOfClass("Backpack")
 	if bp then
 		for _, c in ipairs(bp:GetChildren()) do
 			if c:IsA("Tool") and nameIsBomb(c.Name) then return c end
@@ -185,7 +186,7 @@ local function getRemainingBombTime(plr)
 end
 
 local function getCharacterParts(plr)
-	local char = plr.Character
+	local char = plr and plr.Character
 	if not char then return nil end
 	local hrp = char:FindFirstChild("HumanoidRootPart")
 	local hum = char:FindFirstChildOfClass("Humanoid")
@@ -231,10 +232,11 @@ local function isInSameArena(plr)
 	if not isInMatch(plr) or not isInMatch(LP) then return false end
 	local _, myHrp = getCharacterParts(LP)
 	local _, hrp = getCharacterParts(plr)
+	if not myHrp or not hrp then return false end
 	if math.abs(myHrp.Position.Y - hrp.Position.Y) > Config.YTolerance then return false end
 	local f1, f2 = getFloorPart(LP), getFloorPart(plr)
-	if f1 == f2 or f1.Parent == f2.Parent then return true end
-	return (f1.Position - f2.Position).Magnitude < 80
+	if f1 == f2 or (f1 and f2 and f1.Parent == f2.Parent) then return true end
+	return f1 and f2 and (f1.Position - f2.Position).Magnitude < 80
 end
 
 local function hasFloorAt(p)
@@ -246,7 +248,6 @@ end
 --------------------------------------------------------------------
 -- العوائق والملاحة (Pathfinding) + القفز والتسلق + حماية التمرير
 --------------------------------------------------------------------
-local PathfindingService = game:GetService("PathfindingService")
 local Immune = {} -- لاعبين ما تقدر تمرر لهم فوراً (بعد ما مرروا لك)
 
 local function immuneRemaining(plr)
@@ -257,7 +258,7 @@ end
 local function isImmune(plr)
 	local rem = immuneRemaining(plr)
 	if rem <= 0 then return false end
-	if State.myTime and State.myTime <= rem then return false end -- ما بقي وقت: جرّب على أي حال
+	if State.myTime and State.myTime <= rem then return false end
 	return true
 end
 
@@ -273,7 +274,6 @@ local function charList()
 	return charCache
 end
 
--- راي يتجاهل اللاعبين والأجزاء اللي ما فيها تصادم، ويوقف عند أي حاجز حقيقي (حتى الجدران الشفافة)
 local hardParams = RaycastParams.new()
 hardParams.FilterType = Enum.RaycastFilterType.Exclude
 local function castHard(origin, vec)
@@ -288,7 +288,6 @@ local function castHard(origin, vec)
 	return nil
 end
 
--- هل الطريق من نقطة لنقطة مفتوح (رجل + وسط + راس)؟
 local function clearLine(from, to)
 	local vec = to - from
 	for _, h in ipairs({ -1.5, 0, 1.6 }) do
@@ -311,7 +310,6 @@ end
 
 local Jump = { fails = 0, blockedUntil = 0, last = 0 }
 
--- هل القفز ممكن الحين؟ (الحالة مفعلة + قوة قفز كافية + ما فشل القفز عدة مرات)
 local function canJump(hum)
 	if not hum or hum.Health <= 0 then return false end
 	if now() < Jump.blockedUntil then return false end
@@ -320,7 +318,6 @@ local function canJump(hum)
 	return jumpHeightOf(hum) >= 1.5
 end
 
--- بعد القفزة نتأكد إنها صارت فعلاً؛ لو فشلت كذا مرة نعتبر القفز مقفول في هالساحة
 local function verifyJump(hum)
 	task.delay(0.28, function()
 		if not alive or not hum.Parent then return end
@@ -343,12 +340,11 @@ end
 
 local function forceJump(hum)
 	if not canJump(hum) then return false end
-	if hum.FloorMaterial == Enum.Material.Air then return false end -- لازم تكون على الأرض
+	if hum.FloorMaterial == Enum.Material.Air then return false end
 	local t = now()
 	if t - Jump.last < 0.35 then return false end
 	Jump.last = t
 	hum.Jump = true
-	-- Humanoid.Jump لحاله ينلغي أحياناً من سكربت التحكم، فنأكده بتغيير الحالة
 	pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
 	Stats.jumps += 1
 	verifyJump(hum)
@@ -362,7 +358,6 @@ local function tryJump(hum, chance)
 	return false
 end
 
--- قفز متكرر بفاصل معين (للمراوغات)
 local function pulseJump(hum, interval)
 	local t = now()
 	if t >= (Style.nextJump or 0) and forceJump(hum) then
@@ -370,7 +365,6 @@ local function pulseJump(hum, interval)
 	end
 end
 
--- حاجز واطي قدامك تقدر تقفز فوقه؟
 local function ledgeAhead(hrp, hum, dir)
 	if not canJump(hum) then return false end
 	dir = unit(flat(dir))
@@ -383,7 +377,6 @@ local function ledgeAhead(hrp, hum, dir)
 	return high == nil
 end
 
--- أقرب اتجاه مفتوح للاتجاه المطلوب (يلف حول الجدران)
 local STEER_ANGLES = { 0, 25, -25, 50, -50, 80, -80, 120, -120, 160 }
 local function steerDir(hrp, dir, dist)
 	dir = unit(flat(dir))
@@ -406,7 +399,6 @@ local function navReset()
 	Nav.lastPos, Nav.escapeUntil = nil, 0
 end
 
--- كشف التعليق: إذا ما تحرك، يقفز ويتحرك جانباً ويعيد حساب المسار
 local function stuckCheck(hrp, hum, to)
 	local t = now()
 	if t - Nav.lastCall > 1 then Nav.lastPos = nil end
@@ -429,13 +421,13 @@ local function stuckCheck(hrp, hum, to)
 end
 
 local function navCompute(hrp, goal)
-	if Nav.computing or now() - Nav.lastT < 0.45 then return end
+	if Nav.computing or now() - Nav.lastT < 0.4 then return end
 	Nav.computing, Nav.lastT = true, now()
 	local from = hrp.Position
 	task.spawn(function()
 		local ok = pcall(function()
 			local path = PathfindingService:CreatePath({
-				AgentRadius = 2.2, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = false, WaypointSpacing = 4,
+				AgentRadius = 2.0, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = false, WaypointSpacing = 3.5,
 			})
 			path:ComputeAsync(from, goal)
 			if path.Status == Enum.PathStatus.Success then
@@ -451,7 +443,6 @@ local function navCompute(hrp, goal)
 	end)
 end
 
--- يمشي على المسار الجاهز (مع قفز عند نقاط القفز أو لما النقطة التالية أعلى منك)
 local function followPath(hrp, hum)
 	local wps = Nav.wps
 	if not wps then return false end
@@ -475,20 +466,19 @@ local function followPath(hrp, hum)
 	return false
 end
 
--- حركة ذكية للمطاردة: تتجنب الجدران، تقفز على الحواجز الواطية، وتستخدم مسار للصعود والالتفاف
 local function navMove(hrp, hum, goal)
 	local pos = hrp.Position
 	local to = goal - pos
 	local flatD = flat(to).Magnitude
-	if flatD < 0.5 then hum:MoveTo(pos) return end
+	if flatD < 0.35 then hum:MoveTo(goal) return end
 	if stuckCheck(hrp, hum, to) then return end
 	if not Config.Nav then hum:MoveTo(goal) return end
 
 	local dirG = unit(flat(to))
 
-	if Config.Parkour and flatD > 1.5 and ledgeAhead(hrp, hum, dirG) then
+	if Config.Parkour and flatD > 1.2 and ledgeAhead(hrp, hum, dirG) then
 		forceJump(hum)
-		hum:MoveTo(pos + dirG * 8)
+		hum:MoveTo(goal)
 		return
 	end
 
@@ -496,18 +486,20 @@ local function navMove(hrp, hum, goal)
 	local direct = math.abs(dy) < 4 and clearLine(pos, Vector3.new(goal.X, pos.Y, goal.Z))
 	if direct then
 		Nav.wps = nil
+		if flatD <= 7.5 then
+			hum:MoveTo(goal)
+			return
+		end
 		local sd = steerDir(hrp, dirG, 7) or dirG
 		hum:MoveTo(pos + sd * 10)
 		return
 	end
 
-	-- في حاجز أو الهدف فوق: مسار
 	if not Nav.wps or not Nav.goal or flat(Nav.goal - goal).Magnitude > 6 then
 		navCompute(hrp, goal)
 	end
 	if followPath(hrp, hum) then return end
 
-	-- ما في مسار جاهز: توجيه مباشر حول الحواجز
 	local sd = steerDir(hrp, dirG, 8)
 	if sd then
 		hum:MoveTo(pos + sd * 10)
@@ -517,7 +509,6 @@ local function navMove(hrp, hum, goal)
 	end
 end
 
--- حركة الهروب: توجيه حول الحواجز + قفز فوق الحواجز الواطية (باركور)
 local function steerMove(hrp, hum, p)
 	local pos = hrp.Position
 	local dirv = flat(p - pos)
@@ -533,7 +524,6 @@ local function steerMove(hrp, hum, p)
 	hum:MoveTo(pos + (sd or dir) * 10)
 end
 
--- عمود/جدار قريب تختبئ وراه وتدور حوله
 local pillarCache, pillarT = nil, 0
 local function findPillar(hrp)
 	if now() - pillarT < 0.7 then return pillarCache end
@@ -562,9 +552,6 @@ local function coverPoint(hrp, thrp, pl)
 	return c + away * r
 end
 
--- حافة/منصة قريبة تقدر تقفز عليها
---   بدون goal: تختار الأبعد عن المطارد (للهروب لفوق)
---   مع goal:   تختار الأعلى والأقرب للهدف (للتسلق)
 local function findLedge(hrp, hum, thrp, goal)
 	if not canJump(hum) then return nil end
 	local jh = math.max(jumpHeightOf(hum) - 0.6, 2)
@@ -617,7 +604,6 @@ function LG.refreshTrusses()
 	LG.Ladder.list = list
 end
 
--- أفضل سلم: يبدأ من مستواك ويوصل لفوق وقريب من الهدف
 function LG.pickTruss(pos, feetY, goalY, maxD)
 	LG.refreshTrusses()
 	local t0 = now()
@@ -643,7 +629,6 @@ function LG.trussStep(hrp, hum, goal)
 	local goalFlat = flat(goal - pos)
 	LG.Ladder.lastStep = t
 
-	-- أنا على السلم الحين: اطلع، وفوق ادفع للأمام عشان تنزل على المنصة
 	if hum:GetState() == Enum.HumanoidStateType.Climbing then
 		local p = LG.Ladder.part
 		if not p or not p.Parent then
@@ -656,7 +641,6 @@ function LG.trussStep(hrp, hum, goal)
 		local top = p and (p.Position.Y + p.Size.Y / 2) or (feetY + 100)
 		if t - LG.Ladder.lastYT > 1.3 then
 			if p and pos.Y - LG.Ladder.lastY < 0.8 and feetY < top - 3 and goal.Y > feetY + 1 then
-				-- معلّق على السلم: انزل وجرب غيره
 				LG.Ladder.bad[p] = t + 10
 				LG.Ladder.part = nil
 				hum.Jump = true
@@ -674,7 +658,6 @@ function LG.trussStep(hrp, hum, goal)
 		return true
 	end
 
-	-- مو على السلم: اختر سلم وامش له
 	LG.Ladder.lastY, LG.Ladder.lastYT = pos.Y, t
 	local p = LG.Ladder.part
 	if p and (not p.Parent or (LG.Ladder.bad[p] or 0) > t or p.Position.Y + p.Size.Y / 2 <= feetY + 3.5) then
@@ -710,7 +693,6 @@ function LG.trussStep(hrp, hum, goal)
 		hum:MoveTo(Vector3.new(tp.X, pos.Y, tp.Z))
 		if bot > feetY + 1.2 then forceJump(hum) end
 		if t - LG.Ladder.nearT > 2.6 then
-			-- ما دخل السلم من هالجهة (جدار؟): جرب جهة ثانية
 			LG.Ladder.rot = (LG.Ladder.rot + 90) % 360
 			LG.Ladder.nearT = 0
 		end
@@ -718,7 +700,6 @@ function LG.trussStep(hrp, hum, goal)
 	return true
 end
 
--- تسلق: الهدف فوقك → مسار / سلم / وإذا ما في يقفز من حافة لحافة لين يوصله
 local climbCache, climbT = nil, 0
 local function climbMove(hrp, hum, goal)
 	local pos = hrp.Position
@@ -728,27 +709,23 @@ local function climbMove(hrp, hum, goal)
 	local t = now()
 	local cj = canJump(hum)
 
-	-- على سلم أو ماشي له: كمّل بدون ما تقاطعه المسارات
 	if Config.Ladder and (hum:GetState() == Enum.HumanoidStateType.Climbing or (LG.Ladder.part and LG.Ladder.commitUntil > t)) then
 		if LG.trussStep(hrp, hum, goal) then return true end
 	end
 
 	if stuckCheck(hrp, hum, to) then return true end
 
-	-- تحته أو جنبه وضمن مدى القفز: اقفز عليه
 	if cj and fd < 6 and to.Y <= jh + 2.5 then
 		hum:MoveTo(pos + unit(flat(to)) * 8)
 		if forceJump(hum) then Stats.climbs += 1 end
 		return true
 	end
 
-	-- 1) مسار
 	if not Nav.wps or not Nav.goal or flat(Nav.goal - goal).Magnitude > 6 then
 		navCompute(hrp, goal)
 	end
 	if followPath(hrp, hum) then return true end
 
-	-- 2) سلم (المسار فشل أو ما جهز)
 	if Config.Ladder then
 		if Nav.computing then
 			hum:MoveTo(pos)
@@ -757,7 +734,6 @@ local function climbMove(hrp, hum, goal)
 		if LG.trussStep(hrp, hum, goal) then return true end
 	end
 
-	-- 3) حافة تقفز عليها وتقربك منه
 	if now() - climbT > 0.35 then
 		climbT = now()
 		climbCache = findLedge(hrp, hum, nil, goal)
@@ -854,7 +830,7 @@ local function buildMap()
 		local function isWalk(i, j)
 			local row = cells[i]
 			local cell = row and row[j]
-			if not cell then return true end -- خارج الشبكة = مجهول (مو حافة)
+			if not cell then return true end
 			return cell.walk
 		end
 
@@ -933,8 +909,8 @@ local function updateMemory(plr, hrp, hum, myPos)
 	local d = toMe.Magnitude
 	if d > 0.5 and d < 30 and sp > 2 then
 		local u = toMe / d
-		m.away += (-(v:Dot(u) / sp) - m.away) * a   -- +1 يهرب منّي / -1 يهجم
-		m.bias += (v:Dot(perp(u)) / sp - m.bias) * a -- ميل جانبي
+		m.away += (-(v:Dot(u) / sp) - m.away) * a
+		m.bias += (v:Dot(perp(u)) / sp - m.bias) * a
 	end
 	if m.lastVel and sp > 3 and m.lastVel.Magnitude > 3 then
 		local sharp = (v.Unit:Dot(m.lastVel.Unit) < 0.5) and 1 or 0
@@ -966,9 +942,9 @@ end
 -- حساب الوقت
 --------------------------------------------------------------------
 local function urgencyOf(tleft)
-	if not Config.TimeAware or not tleft then return 0.3 end
+	if not Config.TimeAware or not tleft then return 0.35 end
 	local u = math.clamp(1 - tleft / math.max(State.peak, 10), 0, 1)
-	if tleft <= Config.UrgentTime then u = math.max(u, 0.85) end
+	if tleft <= Config.UrgentTime then u = math.max(u, 0.88) end
 	return u
 end
 
@@ -1005,11 +981,12 @@ end
 
 local function updateShiftLock()
 	local _, hrp, hum = getCharacterParts(LP)
-	if not hrp then return end
+	if not hrp or not hum then return end
 	if needShiftLockNow() then
 		if savedAutoRotate == nil then savedAutoRotate = hum.AutoRotate end
 		hum.AutoRotate = false
-		local f = flat(Workspace.CurrentCamera.CFrame.LookVector)
+		local cam = Workspace.CurrentCamera
+		local f = cam and flat(cam.CFrame.LookVector) or Vector3.zero
 		if f.Magnitude > 0.01 then
 			hrp.CFrame = hrp.CFrame:Lerp(CFrame.new(hrp.Position, hrp.Position + f.Unit), 0.25)
 		end
@@ -1022,11 +999,12 @@ local function camTrack()
 	if not (Config.CamTrack and Config.AI) or not State.focus then return end
 	if State.focusDist > 35 then return end
 	local cam = Workspace.CurrentCamera
+	if not cam then return end
 	cam.CFrame = cam.CFrame:Lerp(CFrame.new(cam.CFrame.Position, State.focus), 0.18)
 end
 
 --------------------------------------------------------------------
--- مسح اللاعبين + اختيار الهدف الأذكى
+-- مسح اللاعبين + اختيار الهدف الأذكى للتمرير
 --------------------------------------------------------------------
 local function clearState()
 	State.target, State.targetDist, State.targetMem, State.targetEdge = nil, math.huge, nil, nil
@@ -1040,7 +1018,7 @@ local function chooseTarget(cands, myHum)
 	State.stalk = nil
 	if #cands == 0 then return nil end
 	local u = urgencyOf(State.myTime)
-	local speed = math.max(myHum and myHum.WalkSpeed or 16, 8)
+	local speed = math.max(myHum and myHum.WalkSpeed or 16, 16)
 	local jmpOK = myHum ~= nil and canJump(myHum)
 	local best, bestScore
 	local _, mh = getCharacterParts(LP)
@@ -1049,34 +1027,31 @@ local function chooseTarget(cands, myHum)
 		local s
 		local rem = immuneRemaining(c.plr)
 		if rem > 0 and c.d / speed < rem and not (State.myTime and State.myTime <= rem) then
-			-- محمي مؤقتاً: لا تروح له الحين، دوّر حوله
 			if not State.stalk or c.d < State.stalk.d then State.stalk = c end
 			continue
 		end
-		if u > 0.7 then
-			-- وقت ضيق: أسرع هدف يوصله
-			s = -c.d * 2 - c.m.erratic * 3
+		if u > 0.65 then
+			s = -c.d * 2.4 - c.m.erratic * 2
 		else
-			s = -c.d
+			s = -c.d * 1.25
 			if Config.EdgeAI then
 				local cell = cellAt(c.hrp.Position)
 				if cell and cell.walk then
 					c.edge = cell.edge
-					s += (24 - math.min(cell.edge, 24)) * 0.4
-					if cell.corner then s += 12 end
+					s += (24 - math.min(cell.edge, 24)) * 0.35
+					if cell.corner then s += 14 end
 				end
 			end
 			if Config.Memory and c.m.time > 3 then
-				s += -c.m.speed * 0.6 - c.m.erratic * 10 - (c.m.jumps / math.max(c.m.time, 6)) * 8 + c.m.stop * 8
+				s += -c.m.speed * 0.45 - c.m.erratic * 7 - (c.m.jumps / math.max(c.m.time, 6)) * 6 + c.m.stop * 10
 			end
 		end
 		if Config.TimeAware and State.myTime then
 			local eta = c.d / speed
-			if eta > State.myTime * 0.9 then s -= (eta - State.myTime * 0.9) * 10 end
+			if eta > State.myTime * 0.85 then s -= (eta - State.myTime * 0.85) * 12 end
 		end
-		-- الأهداف العالية أصعب (أخف لو تقدر تقفز وتتسلق)
 		s -= math.max(c.hrp.Position.Y - myY, 0) * ((jmpOK and Config.Climb) and 0.25 or 0.8)
-		if State.lockedTarget == c.plr then s += 6 end
+		if State.lockedTarget == c.plr then s += 8 end
 		if not best or s > bestScore then best, bestScore = c, s end
 	end
 	if not best then return nil end
@@ -1099,17 +1074,19 @@ local function scanPlayers()
 	for _, plr in ipairs(Players:GetPlayers()) do
 		if not isTeammate(plr) and isInSameArena(plr) then
 			local _, hrp, hum = getCharacterParts(plr)
-			local m = updateMemory(plr, hrp, hum, myHrp.Position)
-			local d = flat(hrp.Position - myHrp.Position).Magnitude
-			local theirBomb = hasBomb(plr)
-			enemies[#enemies + 1] = { plr = plr, hrp = hrp }
-			if iHave then
-				if not theirBomb then cands[#cands + 1] = { plr = plr, hrp = hrp, hum = hum, d = d, m = m } end
-			elseif theirBomb and d < State.threatDist then
-				State.threat, State.threatDist, State.threatMem = plr, d, m
-				local toMe = flat(myHrp.Position - hrp.Position)
-				if toMe.Magnitude > 0.1 then
-					State.approaching = toMe.Unit:Dot(hrp.AssemblyLinearVelocity) > 8
+			if hrp and hum then
+				local m = updateMemory(plr, hrp, hum, myHrp.Position)
+				local d = flat(hrp.Position - myHrp.Position).Magnitude
+				local theirBomb = hasBomb(plr)
+				enemies[#enemies + 1] = { plr = plr, hrp = hrp }
+				if iHave then
+					if not theirBomb then cands[#cands + 1] = { plr = plr, hrp = hrp, hum = hum, d = d, m = m } end
+				elseif theirBomb and d < State.threatDist then
+					State.threat, State.threatDist, State.threatMem = plr, d, m
+					local toMe = flat(myHrp.Position - hrp.Position)
+					if toMe.Magnitude > 0.1 then
+						State.approaching = toMe.Unit:Dot(hrp.AssemblyLinearVelocity) > 7.5
+					end
 				end
 			end
 		end
@@ -1162,7 +1139,7 @@ local function bestEscapePoint(hrp, thrp)
 			if cell then
 				score += math.min(cell.edge, 24) * 0.9 + cell.open * 10
 				if cell.corner then score -= 30 end
-				local far = cellAt(hrp.Position + dir * 28) -- نظرة مستقبلية: تجنب الطرق المسدودة
+				local far = cellAt(hrp.Position + dir * 28)
 				if far then score += far.walk and 4 or -8 end
 			else
 				for _, o in ipairs(EDGE_OFFS) do
@@ -1185,7 +1162,7 @@ local function bestEscapePoint(hrp, thrp)
 end
 
 --------------------------------------------------------------------
--- المراوغات والمطاردة (مهارات كثيرة + ملاحة + قفز)
+-- المراوغات والمطاردة للتمرير (مهارات كثيرة + ملاحة + قفز)
 --------------------------------------------------------------------
 local function pickWeighted(list)
 	local sum = 0
@@ -1199,15 +1176,12 @@ local function pickWeighted(list)
 end
 
 local FLEE_DUR = {
-	-- عادية
 	smart = { 0.6, 1.4 }, zigzag = { 1.0, 2.0 }, circle = { 1.0, 2.0 }, feint = { 0.7, 0.7 },
 	brake = { 0.6, 0.6 }, kite = { 1.0, 2.0 }, juke = { 0.9, 0.9 }, pillar = { 1.2, 2.5 },
 	weave = { 1.0, 1.8 }, snake = { 0.9, 1.6 }, spiral = { 1.0, 1.8 }, stopgo = { 0.8, 0.8 },
 	loop = { 1.5, 2.5 }, dash = { 0.6, 0.9 }, cutback = { 0.9, 0.9 },
-	-- قفز (فقط لو القفز ممكن)
 	bhop = { 1.0, 1.8 }, hop = { 1.2, 1.2 }, jumpjuke = { 0.9, 0.9 }, hopcircle = { 1.2, 2.0 },
 	leap = { 1.0, 1.6 }, jumpfeint = { 0.8, 0.8 }, zigjump = { 1.0, 1.8 }, doublehop = { 1.0, 1.0 },
-	-- أسطورية (v6)
 	phantom = { 0.9, 1.0 }, figure8 = { 1.4, 2.4 }, ghost = { 0.8, 1.4 }, sidewinder = { 1.2, 2.0 }, snapback = { 1.0, 1.6 },
 	airstrafe = { 1.2, 2.0 }, skydance = { 1.0, 1.1 }, ladder = { 3.5, 4.5 },
 }
@@ -1225,7 +1199,7 @@ local function pickFleeStyle(ctx, d, forceSide, m)
 		Style.name, dur = "sidestep", rng:NextNumber(0.3, 0.5)
 		Style.lastSide = t
 		if Config.Memory and m and m.time > 3 and math.abs(m.bias) > 0.2 then
-			Style.dir = (m.bias > 0) and -1 or 1 -- عكس ميله
+			Style.dir = (m.bias > 0) and -1 or 1
 		end
 	else
 		local last2 = State.threatTime ~= nil and State.threatTime <= 2.5
@@ -1238,7 +1212,6 @@ local function pickFleeStyle(ctx, d, forceSide, m)
 		local function addJ(name, w) if jmp then add(name, w * jw) end end
 		local hasCenter = getCenter() ~= nil
 
-		-- هروب للسلالم: سلم قريب أبعد عن المطارد منّي
 		local trussPick
 		if Config.Ladder and d > 6 then
 			local fy = ctx.hrp.Position.Y - (ctx.hum.HipHeight + ctx.hrp.Size.Y / 2)
@@ -1250,7 +1223,6 @@ local function pickFleeStyle(ctx, d, forceSide, m)
 		local function addL(w) if trussPick then add("ladder", w) end end
 
 		if last2 then
-			-- آخر ثواني: لا تخليه يمررها لك
 			add("kite", 3); add("juke", 2); add("sidestep", 1); add("dash", 1.5); add("cutback", 1.5)
 			if pillar then add("pillar", 2) end
 			if ledge then add("hop", 2 * jw) end
@@ -1327,12 +1299,10 @@ local function fleePoint(hrp, hum, thrp, d)
 		local v = unit(flat(thrp.AssemblyLinearVelocity))
 		p = pos + unit(perp(v) * Style.dir + away * 0.4) * 12
 	elseif n == "kite" then
-		-- يدور حوله بمسافة آمنة (برا مدى الريتش)
 		local rot = rotate(away, 35 * Style.dir)
 		local q = thrp.Position + unit(rot) * 20
 		p = Vector3.new(q.X, pos.Y, q.Z)
 	elseif n == "juke" then
-		-- 3 قلبات سريعة ثم اندفاع جانبي
 		local side
 		if el < 0.15 then side = 1 elseif el < 0.3 then side = -1 elseif el < 0.45 then side = 1 end
 		if side then
@@ -1347,20 +1317,14 @@ local function fleePoint(hrp, hum, thrp, d)
 			if hasFloorAt(cp) then return cp end
 		end
 		return bestEscapePoint(hrp, thrp)
-
-	-------------------- مراوغات عادية جديدة --------------------
 	elseif n == "weave" then
-		-- تعرّج ناعم (موجة) وهو يبتعد
 		p = pos + unit(rotate(away, math.sin(el * (3.4 + Style.period * 4)) * 70)) * 12
 	elseif n == "snake" then
-		-- تعرّج سريع وضيق
 		p = pos + unit(rotate(away, math.sin(el * 9) * 45)) * 12
 	elseif n == "spiral" then
-		-- يلتف حوله بزاوية تكبر تدريجياً
 		local ang = math.clamp(25 + el * 70, 25, 110) * Style.dir
 		p = pos + unit(rotate(away, ang)) * 12
 	elseif n == "stopgo" then
-		-- جري ثم وقفة مفاجئة ثم انطلاقة جانبية
 		if el < 0.2 then
 			p = pos + away * 8
 		elseif el < 0.38 then
@@ -1369,7 +1333,6 @@ local function fleePoint(hrp, hum, thrp, d)
 			p = pos + unit(perp(away) * Style.dir + away * 0.5) * 14
 		end
 	elseif n == "loop" then
-		-- يلف حول مركز الساحة من الجهة اللي تبعده عن المطارد
 		local center = getCenter()
 		if not center then return bestEscapePoint(hrp, thrp) end
 		local toC = flat(center - pos)
@@ -1378,7 +1341,6 @@ local function fleePoint(hrp, hum, thrp, d)
 		if tang:Dot(away) < 0 then tang = -tang end
 		p = pos + unit(tang + unit(toC) * 0.35) * 13
 	elseif n == "dash" then
-		-- اندفاع قطري عكس ميل المطارد ثم تغيير الجهة
 		local v = flat(thrp.AssemblyLinearVelocity)
 		local side = Style.dir
 		if v.Magnitude > 3 then side = (v:Dot(perp(away)) > 0) and -1 or 1 end
@@ -1388,14 +1350,11 @@ local function fleePoint(hrp, hum, thrp, d)
 			p = pos + unit(away - perp(away) * side * 0.5) * 14
 		end
 	elseif n == "cutback" then
-		-- جري مستقيم ثم التفاف حاد فجأة
 		if el < 0.35 then
 			p = pos + away * 12
 		else
 			p = pos + unit(rotate(away, 110 * Style.dir)) * 12
 		end
-
-	-------------------- مراوغات القفز (فقط لو القفز ممكن) --------------------
 	elseif n == "bhop" then
 		pulseJump(hum, 0.5)
 		return bestEscapePoint(hrp, thrp)
@@ -1431,7 +1390,6 @@ local function fleePoint(hrp, hum, thrp, d)
 		p = pos + unit(away + perp(away) * sgn * Style.dir * 0.6) * 13
 		pulseJump(hum, 0.4)
 	elseif n == "leap" then
-		-- يستنى لين يقرب منه ثم يقفز قفزة جانبية
 		if d < 9 and State.approaching then
 			p = pos + unit(perp(away) * Style.dir + away * 0.7) * 13
 			pulseJump(hum, 0.5)
@@ -1445,9 +1403,7 @@ local function fleePoint(hrp, hum, thrp, d)
 		else
 			p = pos + unit(perp(away) * -Style.dir + away * 0.9) * 14
 		end
-	-------------------- أسطورية (v6) --------------------
 	elseif n == "phantom" then
-		-- التزام وهمي بجهة ← وقفة ميتة ← انفجار للجهة المعاكسة
 		if el < 0.22 then
 			p = pos + unit(perp(away) * Style.dir + away * 0.5) * 10
 		elseif el < 0.34 then
@@ -1456,15 +1412,12 @@ local function fleePoint(hrp, hum, thrp, d)
 			p = pos + unit(perp(away) * -Style.dir + away * 0.8) * 15
 		end
 	elseif n == "figure8" then
-		-- رقم 8: يبدل جهة الدوران كل نص ثانية وهو يبتعد
 		local s = (math.floor(el / 0.55) % 2 == 0) and 1 or -1
 		p = pos + unit(perp(away) * s * Style.dir + away * 0.55) * 12
 	elseif n == "ghost" then
-		-- ارتعاش جانبي سريع جداً يصعّب التوقع
 		local s = math.sin(el * 13) >= 0 and 1 or -1
 		p = pos + unit(away + perp(away) * s * 0.85) * 12
 	elseif n == "sidewinder" then
-		-- دايماً عمودي على اتجاه جري المطارد، ويعكس كل ~1 ثانية
 		local tv = flat(thrp.AssemblyLinearVelocity)
 		local ref = tv.Magnitude > 3 and tv.Unit or -away
 		local s = (math.floor(el / 0.9) % 2 == 0) and 1 or -1
@@ -1472,7 +1425,6 @@ local function fleePoint(hrp, hum, thrp, d)
 		if sd:Dot(away) < -0.2 then sd = -sd end
 		p = pos + unit(sd + away * 0.4) * 12
 	elseif n == "snapback" then
-		-- يجري مستقيم ولما يقرب المطارد ينكسر 100 درجة فجأة (حسب المسافة مو الوقت)
 		if d > 10 then
 			p = pos + away * 12
 		else
@@ -1482,12 +1434,10 @@ local function fleePoint(hrp, hum, thrp, d)
 			p = pos + unit(rotate(away, 100 * side)) * 14
 		end
 	elseif n == "airstrafe" then
-		-- كل قفزة باتجاه جانبي معاكس للي قبلها
 		local s = (math.floor(el / 0.46) % 2 == 0) and 1 or -1
 		p = pos + unit(away + perp(away) * s * Style.dir) * 13
 		pulseJump(hum, 0.46)
 	elseif n == "skydance" then
-		-- فانتوم + قفزات في الهواء
 		if el < 0.22 then
 			p = pos + unit(perp(away) * Style.dir + away * 0.5) * 10
 			pulseJump(hum, 0.3)
@@ -1516,56 +1466,85 @@ local function fleePoint(hrp, hum, thrp, d)
 	return p
 end
 
-local function pickChaseStyle(hum)
+local function pickChaseStyle(hum, d, urg)
 	local t = now()
-	local k = 1.5 - Config.Aggro
+	local k = 1.45 - Config.Aggro
 	Style.mode, Style.phaseT, Style.data, Style.nextJump = "chase", t, nil, 0
 	Style.dir = rng:NextInteger(0, 1) == 0 and 1 or -1
-	local u = urgencyOf(State.myTime)
 	local jmp = Config.JumpDodge and Config.JumpRate > 0.01 and canJump(hum)
 	local jw = Config.JumpRate * 2
 	local list
-	if Config.EdgeAI and State.targetEdge and State.targetEdge <= 16 then
-		list = { { "pin", 3 }, { "direct", 1 }, { "cutoff", 1 }, { "stutter", 0.6 }, { "weave", 0.6 }, { "intercept", 1.2 } }
-	elseif u < 0.3 then
+	if (d and d < 8.5) or (urg and urg > 0.65) then
+		list = { { "intercept", 3.5 }, { "cutoff", 2.5 }, { "direct", 2.2 }, { "pin", 1.5 } }
+		if jmp then list[#list + 1] = { "leapin", 1.2 * jw } end
+	elseif Config.EdgeAI and State.targetEdge and State.targetEdge <= 16 then
+		list = { { "pin", 3.2 }, { "intercept", 2.4 }, { "cutoff", 1.8 }, { "direct", 1.5 } }
+	elseif (urg or 0) < 0.3 then
 		list = {
-			{ "flank", 2 }, { "feint", 2 }, { "cutoff", 1.5 }, { "arc", 1.5 }, { "bait", 1.2 },
-			{ "stutter", 1.2 }, { "mirror", 1.5 }, { "direct", 1 }, { "weave", 1.4 }, { "ambush", 1.2 }, { "intercept", 2 },
+			{ "intercept", 2.8 }, { "cutoff", 2.0 }, { "flank", 1.8 }, { "arc", 1.5 },
+			{ "stutter", 1.0 }, { "mirror", 1.4 }, { "direct", 1.4 }, { "weave", 1.1 }, { "feint", 1.1 },
 		}
 		if jmp then
 			list[#list + 1] = { "hopchase", 0.8 * jw }
-			list[#list + 1] = { "hopflank", 1 * jw }
-			list[#list + 1] = { "hopweave", 1 * jw }
-			list[#list + 1] = { "fakecut", 1 * jw }
-			list[#list + 1] = { "leapin", 1 * jw }
+			list[#list + 1] = { "hopflank", 0.9 * jw }
+			list[#list + 1] = { "fakecut", 0.9 * jw }
+			list[#list + 1] = { "leapin", 1.1 * jw }
 		end
 	else
-		list = { { "direct", 3 }, { "cutoff", 2 }, { "flank", 1.2 }, { "arc", 1.2 }, { "feint", 1 }, { "mirror", 0.8 }, { "weave", 1 }, { "intercept", 2.5 } }
+		list = { { "intercept", 3.2 }, { "direct", 2.5 }, { "cutoff", 2.2 }, { "flank", 1.3 }, { "arc", 1.2 }, { "mirror", 1.0 } }
 		if jmp then
 			list[#list + 1] = { "hopchase", 0.8 * jw }
-			list[#list + 1] = { "hopflank", 0.8 * jw }
 			list[#list + 1] = { "fakecut", 0.8 * jw }
-			list[#list + 1] = { "leapin", 1 * jw }
+			list[#list + 1] = { "leapin", 1.1 * jw }
 		end
 	end
 	Style.name = pickWeighted(list)
-	local dur = rng:NextNumber(0.8, 1.5)
-	if Style.name == "feint" or Style.name == "bait" then dur = 0.8 end
-	Style.untilT = t + dur * k
+	local dur = rng:NextNumber(0.65, 1.25)
+	if Style.name == "feint" or Style.name == "bait" then dur = 0.55 end
+	Style.untilT = t + math.max(0.35, dur * k)
 end
 
-local function chasePoint(hrp, hum, thrp, d, m)
+local function computePassIntercept(hrp, hum, thrp, d, urg)
 	local pos = hrp.Position
 	local tpos = thrp.Position
 	local tvel = flat(thrp.AssemblyLinearVelocity)
-	local lead = math.clamp(d / 16, 0, 0.8)
-	local predicted = tpos + tvel * lead
+	local sp = math.max(hum.WalkSpeed, 16)
+	local maxLead = (urg and urg > 0.65) and 0.45 or 0.72
+	local rel = flat(tpos - pos)
+	local a = tvel:Dot(tvel) - sp * sp
+	local b = 2 * rel:Dot(tvel)
+	local c = rel:Dot(rel)
+	local tt
+	if math.abs(a) < 1e-3 then
+		if b < -1e-3 then tt = -c / b end
+	else
+		local disc = b * b - 4 * a * c
+		if disc >= 0 then
+			local sq = math.sqrt(disc)
+			local t1, t2 = (-b - sq) / (2 * a), (-b + sq) / (2 * a)
+			if t1 > 0 and t2 > 0 then tt = math.min(t1, t2) else tt = math.max(t1, t2) end
+		end
+	end
+	if tt and tt > 0 then
+		return tpos + tvel * math.clamp(tt, 0, maxLead)
+	end
+	return tpos + tvel * math.clamp(d / math.max(sp, 10), 0, maxLead)
+end
 
-	-- ذاكرة الخصم: يعدّل التوقع حسب ميله وتوقفه
+local function chasePoint(hrp, hum, thrp, d, m, urg)
+	local pos = hrp.Position
+	local tpos = thrp.Position
+	local tvel = flat(thrp.AssemblyLinearVelocity)
+	local predicted = computePassIntercept(hrp, hum, thrp, d, urg)
+
+	if d <= 7.5 or (urg and urg > 0.7) then
+		return tpos + tvel * math.clamp(d / 20, 0, 0.25)
+	end
+
 	if Config.Memory and m and m.time > 3 then
 		local uu = unit(flat(pos - tpos))
-		predicted += perp(uu) * m.bias * lead * m.speed * 0.5
-		if m.stop > 0.4 then predicted = tpos + (predicted - tpos) * 0.5 end
+		predicted += perp(uu) * m.bias * 0.25 * math.min(m.speed, 18)
+		if m.stop > 0.4 then predicted = tpos + (predicted - tpos) * 0.35 end
 	end
 
 	local el = now() - Style.phaseT
@@ -1574,85 +1553,57 @@ local function chasePoint(hrp, hum, thrp, d, m)
 
 	if n == "flank" then
 		local back = -unit(flat(thrp.CFrame.LookVector))
-		if d > 7 then return predicted + back * 5 + perp(back) * Style.dir * 3 end
+		if d > 8 then return predicted + back * 3.5 + perp(back) * Style.dir * 2 end
 	elseif n == "cutoff" then
-		return tpos + tvel * math.clamp(d / 10, 0.3, 1.1)
+		return tpos + tvel * math.clamp(d / 12, 0.15, 0.75)
 	elseif n == "feint" then
-		if d > 7 and el < 0.3 then
-			return pos + unit(perp(toT) * Style.dir) * 8
+		if d > 9 and el < 0.2 then
+			return pos + unit(perp(toT) * Style.dir + toT * 0.6) * 8
 		end
 	elseif n == "pin" then
 		local center = getCenter()
 		if center then
 			local inward = unit(flat(center - tpos))
 			local imInside = flat(center - pos).Magnitude < flat(center - tpos).Magnitude
-			if imInside then return predicted + inward * 3 end
-			return tpos + inward * 7 + perp(inward) * Style.dir * 6
+			if imInside then return predicted + inward * 2 end
+			return tpos + inward * 5 + perp(inward) * Style.dir * 3.5
 		end
 	elseif n == "stutter" then
-		-- وقف/انطلق عشان يخرب توقيت مراوغته
-		if (el % 0.55) < 0.16 and d > 8 then return pos end
+		if (el % 0.6) < 0.1 and d > 10 then return pos + toT * 4 end
 	elseif n == "mirror" then
-		-- يوازي حركته الجانبية ثم ينقض
-		if d > 8 and el < 0.7 then
+		if d > 9 and el < 0.45 then
 			local lat = tvel:Dot(perp(toT))
 			local sgn = lat >= 0 and 1 or -1
-			return pos + unit(toT * 0.5 + perp(toT) * sgn * 0.9) * 10
+			return pos + unit(toT * 0.75 + perp(toT) * sgn * 0.65) * 10
 		end
 	elseif n == "arc" then
-		return predicted + perp(toT) * Style.dir * math.clamp(d * 0.5, 0, 8)
+		return predicted + perp(toT) * Style.dir * math.clamp(d * 0.28, 0, 4.5)
 	elseif n == "bait" then
-		-- يتراجع شوي عشان يستفزه ثم ينقض
-		if el < 0.35 and d > 8 then
-			local q = pos - toT * 8
+		if el < 0.22 and d > 10 then
+			local q = pos - toT * 5
 			if hasFloorAt(q) then return q end
 		end
 	elseif n == "weave" or n == "hopweave" then
-		-- يقترب بتعرّج عشان يربك توقعاته
-		if n == "hopweave" and d > 6 then pulseJump(hum, 0.65) end
-		if d > 6 then
-			return predicted + perp(toT) * math.sin(el * 7) * math.clamp(d * 0.35, 0, 5)
+		if n == "hopweave" and d > 7 then pulseJump(hum, 0.65) end
+		if d > 7 then
+			return predicted + perp(toT) * math.sin(el * 7) * math.clamp(d * 0.22, 0, 3)
 		end
 	elseif n == "ambush" then
-		-- يثبت لحظة ثم ينقض
-		if el < 0.45 and d > 9 then return pos end
+		if el < 0.25 and d > 10 then return pos + toT * 5 end
 	elseif n == "hopchase" then
-		if d > 6 then pulseJump(hum, 0.6) end
+		if d > 7 then pulseJump(hum, 0.6) end
 	elseif n == "hopflank" then
-		if d > 7 then
+		if d > 8 then
 			pulseJump(hum, 0.7)
 			local back = -unit(flat(thrp.CFrame.LookVector))
-			return predicted + back * 5 + perp(back) * Style.dir * 3
+			return predicted + back * 3.5 + perp(back) * Style.dir * 2
 		end
 	elseif n == "leapin" then
 		if d < 10 and d > 4 then pulseJump(hum, 0.55) end
-	elseif n == "intercept" then
-		-- حل رياضي لنقطة التقاطع: وين نلتقيه لو جرينا بأقصى سرعة
-		local sp = math.max(hum.WalkSpeed, 8)
-		local rel = flat(tpos - pos)
-		local a = tvel:Dot(tvel) - sp * sp
-		local b = 2 * rel:Dot(tvel)
-		local c = rel:Dot(rel)
-		local tt
-		if math.abs(a) < 1e-3 then
-			if b < -1e-3 then tt = -c / b end
-		else
-			local disc = b * b - 4 * a * c
-			if disc >= 0 then
-				local sq = math.sqrt(disc)
-				local t1, t2 = (-b - sq) / (2 * a), (-b + sq) / (2 * a)
-				if t1 > 0 and t2 > 0 then tt = math.min(t1, t2) else tt = math.max(t1, t2) end
-			end
-		end
-		if tt and tt > 0 then
-			tt = math.clamp(tt, 0, 1.3)
-			return tpos + tvel * tt
-		end
 	elseif n == "fakecut" then
-		-- فيك جانبي مع قفزة ثم ينقض
-		if d > 7 and el < 0.3 then
+		if d > 8 and el < 0.2 then
 			pulseJump(hum, 0.3)
-			return pos + unit(perp(toT) * Style.dir) * 8
+			return pos + unit(perp(toT) * Style.dir + toT * 0.6) * 8
 		end
 	end
 	return predicted
@@ -1694,7 +1645,6 @@ function LG.reflexTrigger(hrp, hum, thrp, m, dist)
 	local dur = best[2] == "slip" and 0.34 or 0.26
 	LG.Reflex.brakeUntil = 0
 	if rng:NextNumber() < 0.22 and dist > 5 then
-		-- فيك بريك: وقفة جزء من الثانية ثم انفجار
 		LG.Reflex.brakeUntil = t + 0.07
 		dur += 0.07
 	end
@@ -1711,7 +1661,7 @@ function LG.reflexStep()
 	if not (Config.Reflex and Config.AI) then return end
 	local t = now()
 	local _, hrp, hum = getCharacterParts(LP)
-	if not hrp or hasBomb(LP) then
+	if not hrp or not hum or hasBomb(LP) then
 		LG.Reflex.untilT = 0
 		return
 	end
@@ -1789,7 +1739,7 @@ end
 local function resetAI()
 	Style.mode, Style.name, Style.untilT, Style.cache, Style.data, Style.nextJump = "", "", 0, nil, nil, 0
 	State.peak, State.lastHT, State.lockedTarget = 0, 0, nil
-	Jump.fails, Jump.blockedUntil = 0, 0 -- كل جولة/ساحة نختبر القفز من جديد
+	Jump.fails, Jump.blockedUntil = 0, 0
 	climbCache = nil
 	navReset()
 	LG.Ladder.part, LG.Ladder.bad, LG.Ladder.list, LG.Ladder.listT, LG.Ladder.commitUntil = nil, {}, {}, -100, 0
@@ -1799,11 +1749,11 @@ end
 
 local function aiStep()
 	local _, hrp, hum = getCharacterParts(LP)
-	if not hrp then return end
+	if not hrp or not hum then return end
+	if hum.WalkSpeed > 0 and hum.WalkSpeed < 16 then hum.WalkSpeed = 16 end
 	local t = now()
 	local pos = hrp.Position
 
-	-- معلّق على سلم بدون سبب (مرّ عليه بالغلط): انزل منه
 	if Config.Ladder and t - LG.Ladder.lastStep > 0.8 and hum:GetState() == Enum.HumanoidStateType.Climbing then
 		hum.Jump = true
 	end
@@ -1813,7 +1763,6 @@ local function aiStep()
 		if not tg then
 			local sk = State.stalk
 			if sk then
-				-- كل الخصوم محميين مؤقتاً: دوّر حول أقربهم بدون ما تلمسه لين تنتهي الحماية
 				if Style.mode ~= "stalk" then
 					Style.mode, Style.name = "stalk", "stalk"
 					Style.dir = rng:NextInteger(0, 1) == 0 and 1 or -1
@@ -1836,31 +1785,32 @@ local function aiStep()
 		if not thrp then return end
 		local d = State.targetDist
 		local u = urgencyOf(State.myTime)
-		if Style.mode ~= "chase" or t > Style.untilT then pickChaseStyle(hum) end
+		if Style.mode ~= "chase" or t > Style.untilT then pickChaseStyle(hum, d, u) end
 
 		local p
-		if d < 6 or u > 0.75 then
-			p = thrp.Position + flat(thrp.AssemblyLinearVelocity) * math.clamp(d / 16, 0, 0.5)
+		if d < 5.5 or u > 0.72 then
+			p = thrp.Position + flat(thrp.AssemblyLinearVelocity) * math.clamp(d / 20, 0, 0.25)
 		else
-			p = chasePoint(hrp, hum, thrp, d, State.targetMem)
+			p = chasePoint(hrp, hum, thrp, d, State.targetMem, u)
 		end
 
-		-- الخصم واقف فوق (منصة/مرتفع) وأنا أقدر أقفز: اطلع له
 		local dyT = thrp.Position.Y - pos.Y
 		local standing = thum ~= nil and (thum.FloorMaterial ~= Enum.Material.Air or thum:GetState() == Enum.HumanoidStateType.Climbing)
 		local climbing = Config.Climb and dyT > 2.5 and standing
 
 		if climbing and climbMove(hrp, hum, thrp.Position) then
-			-- تسلق (مسار أو قفز من حافة لحافة)
-		elseif (p - pos).Magnitude < 0.5 then
-			hum:MoveTo(pos)
+			-- تسلق
+		elseif d <= 5.5 and clearLine(pos, thrp.Position) then
+			hum:MoveTo(thrp.Position)
+		elseif (p - pos).Magnitude < 0.35 then
+			hum:MoveTo(p)
 		else
 			navMove(hrp, hum, p)
 		end
 
-		if Config.Parkour and dyT > 2 and dyT < jumpHeightOf(hum) + 1 and d < 6 then forceJump(hum) end
+		if Config.Parkour and dyT > 2 and dyT < jumpHeightOf(hum) + 1 and d < 6.5 then forceJump(hum) end
 	else
-		if LG.Reflex.untilT > t then return end -- الريفلكس يتحكم بالحركة
+		if LG.Reflex.untilT > t then return end
 		local th = State.threat
 		if not th or State.threatDist > Config.FleeRange + 14 then
 			if Config.SafeZone and Map.ready then LG.safeZone(hrp, hum, th) else hum:MoveTo(pos) end
@@ -1897,37 +1847,50 @@ local function aiStep()
 end
 
 --------------------------------------------------------------------
--- Reach
+-- Reach (تسليم القنبلة بسهولة)
 --------------------------------------------------------------------
 local lastReach = 0
 local function reachStep()
-	if now() - lastReach < 0.1 then return end
-	local _, hrp = getCharacterParts(LP)
+	if now() - lastReach < 0.06 then return end
+	local char, hrp, hum = getCharacterParts(LP)
 	if not hrp then return end
 	local bomb = findBombObject(LP)
 	if not bomb then return end
 
+	if bomb:IsA("Tool") and bomb.Parent ~= char and hum then
+		pcall(function() hum:EquipTool(bomb) end)
+	end
+
 	local range = Config.ReachDistance
-	if Config.TimeAware and urgencyOf(State.myTime) > 0.6 then range *= 1.25 end
+	if Config.TimeAware and urgencyOf(State.myTime) > 0.6 then range *= 1.3 end
 
 	local best, bestD
 	for _, plr in ipairs(Players:GetPlayers()) do
 		if not isTeammate(plr) and isInSameArena(plr) and not hasBomb(plr) and not isImmune(plr) then
-			local _, thrp = getCharacterParts(plr)
-			local d = (thrp.Position - hrp.Position).Magnitude
-			if d <= range and (not bestD or d < bestD) then best, bestD = thrp, d end
+			local tchar, thrp = getCharacterParts(plr)
+			if tchar and thrp then
+				local d = (thrp.Position - hrp.Position).Magnitude
+				if d <= range and (not bestD or d < bestD) then best, bestD = { char = tchar, hrp = thrp }, d end
+			end
 		end
 	end
 	if not best then return end
-	lastReach = now() + rng:NextNumber(0, 0.04)
+	lastReach = now() + rng:NextNumber(0, 0.025)
 
 	if bomb:IsA("Tool") then pcall(function() bomb:Activate() end) end
 	if firetouchinterest then
-		local part = (bomb:IsA("Tool") and bomb:FindFirstChild("Handle")) or (bomb:IsA("BasePart") and bomb) or hrp
-		pcall(function()
-			firetouchinterest(part, best, 0)
-			firetouchinterest(part, best, 1)
-		end)
+		local srcPart = (bomb:IsA("Tool") and (bomb:FindFirstChild("Handle") or bomb:FindFirstChildWhichIsA("BasePart")))
+			or (bomb:IsA("BasePart") and bomb)
+			or hrp
+		local targets = { best.hrp }
+		local torso = best.char:FindFirstChild("UpperTorso") or best.char:FindFirstChild("Torso")
+		if torso then targets[#targets + 1] = torso end
+		for _, tp in ipairs(targets) do
+			pcall(function()
+				firetouchinterest(srcPart, tp, 0)
+				firetouchinterest(srcPart, tp, 1)
+			end)
+		end
 	end
 end
 
@@ -1982,7 +1945,6 @@ for _, old in ipairs(gui.Parent:GetChildren()) do
 	if old.Name == "MatchPanelUI" and old ~= gui then old:Destroy() end
 end
 
--- حجم القائمة يتكيف مع الشاشة (جوال/كمبيوتر)
 local camera = Workspace.CurrentCamera
 local vp = camera and camera.ViewportSize or Vector2.new(1280, 720)
 local PANEL_W = 316
@@ -2004,7 +1966,6 @@ corner(main, 14)
 local mainStroke = addStroke(main, Color3.new(1, 1, 1), 2, 0)
 local strokeGrad = gradient(mainStroke, C.accent, C.accent2, 0)
 
--- شريط العنوان (كبسولة عائمة) + أزرار  -  +  x
 local title = Instance.new("Frame")
 title.Name = "Header"
 title.Position = UDim2.new(0, 6, 0, 6)
@@ -2038,11 +1999,10 @@ local function headBtn(xOffset, text, color)
 	corner(b, 8)
 	return b
 end
-local minBtn = headBtn(-92, "-", C.warn)     -- يغلق القائمة
-local plusBtn = headBtn(-62, "+", C.good)    -- يفتح القائمة
-local closeBtn = headBtn(-32, "x", C.bad)    -- يطفي السكربت
+local minBtn = headBtn(-92, "-", C.warn)
+local plusBtn = headBtn(-62, "+", C.good)
+local closeBtn = headBtn(-32, "x", C.bad)
 
--- جسم القائمة (كل شي تحت الشريط)
 local body = Instance.new("Frame")
 body.Name = "Body"
 body.Position = UDim2.new(0, 0, 0, HEAD_H)
@@ -2050,7 +2010,6 @@ body.Size = UDim2.new(1, 0, 1, -HEAD_H)
 body.BackgroundTransparency = 1
 body.Parent = main
 
--- عداد القنبلة
 local meter = Instance.new("Frame")
 meter.Position = UDim2.new(0, 8, 0, 2)
 meter.Size = UDim2.new(1, -16, 0, 62)
@@ -2108,7 +2067,6 @@ setMeter = function(who, whoColor, tleft, urg, styleName)
 	infoText.Text = string.format("STYLE: %s  ·  URG: %d%%  ·  JUMP: %s", styleName ~= "" and styleName or "-", math.floor(urg * 100), jtxt)
 end
 
--- Toast
 local toastBox = Instance.new("Frame")
 toastBox.AnchorPoint = Vector2.new(0.5, 1)
 toastBox.Position = UDim2.new(0.5, 0, 1, -8)
@@ -2140,7 +2098,6 @@ toast = function(text, color)
 	end)
 end
 
--- التبويبات (شريط مع مؤشر متحرك)
 local pages = {}
 local order = 0
 local function newPage()
@@ -2417,7 +2374,7 @@ function LG.espStep()
 
 	local seen = {}
 	for _, plr in ipairs(Players:GetPlayers()) do
-		if plr ~= LP and isInSameArena(plr) then -- بس اللي معك بنفس الساحة
+		if plr ~= LP and isInSameArena(plr) then
 			local char, hrp = getCharacterParts(plr)
 			if char then
 				seen[plr] = true
@@ -2464,7 +2421,6 @@ function LG.safeClone(inst)
 	return ok and cl or nil
 end
 
--- ننسخ ملابسي الأصلية مرة وحدة عشان نقدر نرجعها، ثم نشيل اللي بيتبدل
 function LG.outfitStrip(char, provided)
 	if not LG.Outfit.backup then
 		local b = Instance.new("Folder")
@@ -2538,7 +2494,6 @@ function LG.findServerPlayer(name)
 	return nil
 end
 
--- لقطة من ملابس اللاعب: من الشخصية الحية بالسيرفر، وإلا من حسابه
 function LG.snapshotOutfit(name)
 	local items, face = {}, nil
 	local function take(container, head)
@@ -2588,7 +2543,6 @@ function LG.applyOutfit(name)
 	end)
 end
 
--- اللعبة ممكن تمسح الملابس كل جولة/ريسباون: نرجعها تلقائياً
 function LG.ensureOutfit()
 	if not (Config.Outfit and LG.Outfit.items) then return end
 	local char, _, hum = getCharacterParts(LP)
@@ -2635,7 +2589,7 @@ makeSection(pControl, "CORE")
 makeToggle(pControl, "AI AUTO-PLAY", "لعب تلقائي كامل", "AI", function(on)
 	if not on then
 		local _, hrp, hum = getCharacterParts(LP)
-		if hum then hum:MoveTo(hrp.Position) end
+		if hum and hrp then hum:MoveTo(hrp.Position) end
 		resetAI()
 	end
 end)
@@ -2832,7 +2786,6 @@ ST.jumps, ST.climbs, ST.jump = makeStat("Jumps"), makeStat("Climb hops"), makeSt
 ST.map, ST.tracked, ST.session = makeStat("Arena cells"), makeStat("Opponents tracked"), makeStat("Session")
 ST.reflex = makeStat("Reflex dodges")
 
--- إغلاق (-) وفتح (+) القائمة | على الكمبيوتر: RightShift
 local collapsed = false
 local collapseToken = 0
 
@@ -2865,7 +2818,6 @@ table.insert(connections, UIS.InputBegan:Connect(function(input, processed)
 	if input.KeyCode == Enum.KeyCode.RightShift then setCollapsed(not collapsed) end
 end))
 
--- سحب القائمة من الشريط
 do
 	local dragging, dragStart, startPos
 	title.InputBegan:Connect(function(input)
@@ -2879,7 +2831,7 @@ do
 	table.insert(connections, UIS.InputChanged:Connect(function(input)
 		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
 			local d = input.Position - dragStart
-			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.X.Offset + d.Y)
 		end
 	end))
 end
@@ -2897,7 +2849,6 @@ local function shutdown()
 	gui:Destroy()
 end
 
--- زر الإغلاق يحتاج ضغطتين عشان ما ينطفي بالغلط
 local closeArmed = 0
 closeBtn.Activated:Connect(function()
 	if closeArmed > 0 and now() - closeArmed < 2 then
@@ -2923,11 +2874,11 @@ local acc, nextStep, wasInMatch, hadBomb, urgentShown, lastSlow = 0, 0.1, false,
 
 table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 	if not alive then return end
-	if Config.Reflex and Config.AI then pcall(LG.reflexStep) end -- كل فريم
+	if Config.Reflex and Config.AI then pcall(LG.reflexStep) end
 	acc += dt
 	if acc < nextStep then return end
 	acc = 0
-	nextStep = Config.Reaction + rng:NextNumber(0, 0.015)
+	nextStep = Config.Reaction + rng:NextNumber(0, 0.01)
 
 	local inMatch = isInMatch(LP)
 	if now() - LG.Outfit.lastCheck > 1.5 then
@@ -2939,7 +2890,7 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 		resetAI()
 		if inMatch then
 			Stats.rounds += 1
-			task.delay(1.5, function() if alive then buildMap() end end) -- تحليل الحافات بداية الجولة
+			task.delay(1.5, function() if alive then buildMap() end end)
 		elseif not Config.AutoRestart then
 			Config.AI, Config.Reach = false, false
 			if Refreshers.AI then Refreshers.AI() end
@@ -2963,7 +2914,6 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 	end
 	if not hasBomb(LP) and not needShiftLockNow() then restoreShiftLockState() end
 
-	-- إشعارات
 	local iHave = hasBomb(LP)
 	if iHave and not hadBomb then
 		local passer = State.lastThreat
@@ -2982,7 +2932,6 @@ table.insert(connections, RunService.Heartbeat:Connect(function(dt)
 		toast("URGENT  •  الوقت يخلص!", C.warn)
 	end
 
-	-- العداد
 	local holderTime = iHave and State.myTime or State.threatTime
 	local urg = urgencyOf(holderTime)
 	if iHave then
